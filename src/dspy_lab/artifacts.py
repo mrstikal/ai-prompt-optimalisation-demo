@@ -1066,6 +1066,53 @@ class ProgramSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class RunDirectoryEntry:
+    """One discovered run directory, valid or explicitly broken."""
+
+    run_id: str
+    run_dir: Path
+    manifest: RunManifest | None
+    error: str | None
+
+    @property
+    def created_at(self) -> str | None:
+        return None if self.manifest is None else self.manifest.created_at
+
+    @property
+    def status(self) -> str | None:
+        return None if self.manifest is None else self.manifest.status
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedDevelopmentRun:
+    """Validated read-only view of one baseline development run."""
+
+    run_dir: Path
+    manifest: RunManifest
+    summary: Mapping[str, object] | None
+    cases: tuple[CaseRecord, ...]
+    rules_text: str
+    programs: Mapping[str, ProgramSnapshot]
+    outcomes: tuple[RecordedOutcome, ...]
+    requests: Mapping[str, RecordedRequest]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedOptimizationRun:
+    """Validated read-only view of one recorded optimization run."""
+
+    run_dir: Path
+    manifest: RunManifest
+    cases: tuple[CaseRecord, ...]
+    rules_text: str
+    programs: Mapping[str, ProgramSnapshot]
+    requests: Mapping[str, RecordedRequest]
+    candidate_stats: Mapping[str, object] | None
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ReplayArchive:
     benchmark_dir: Path
     benchmark: RunManifest
@@ -1077,8 +1124,14 @@ class ReplayArchive:
     programs: Mapping[str, ProgramSnapshot]
     development_outcomes: tuple[RecordedOutcome, ...]
     outcomes: tuple[RecordedOutcome, ...]
+    development_requests: Mapping[str, RecordedRequest]
     requests: Mapping[str, RecordedRequest]
+    optimization_requests: Mapping[str, RecordedRequest]
     candidate_stats: Mapping[str, object] | None
+    development_cases: tuple[CaseRecord, ...]
+    development_rules_text: str
+    development_summary: Mapping[str, object] | None
+    benchmark_summary: Mapping[str, object] | None
     is_measured: bool
     warnings: tuple[str, ...]
 
@@ -1997,6 +2050,313 @@ def is_measured_archive(manifest: RunManifest) -> bool:
     )
 
 
+def list_run_directories(
+    runs_root: Path = RUNS_ROOT,
+    *,
+    kind: RunKind,
+) -> tuple[RunDirectoryEntry, ...]:
+    """Discover run directories without executing or trusting their payload."""
+    folders = {
+        "development": "development",
+        "optimization": "optimization",
+        "benchmark": "benchmarks",
+        "playground": "playground",
+    }
+    root = Path(runs_root) / folders[kind]
+    if not root.is_dir():
+        return ()
+    entries: list[RunDirectoryEntry] = []
+    for child in sorted(root.iterdir(), key=lambda item: item.name):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if re.fullmatch(_PATTERN_RUN_ID, child.name) is None:
+            continue
+        if child.is_symlink():
+            entries.append(
+                RunDirectoryEntry(
+                    run_id=child.name,
+                    run_dir=child,
+                    manifest=None,
+                    error="run directory must not be a symlink",
+                )
+            )
+            continue
+        manifest_path = child / RUN_MANIFEST_FILENAME
+        if not manifest_path.is_file():
+            entries.append(
+                RunDirectoryEntry(
+                    run_id=child.name,
+                    run_dir=child,
+                    manifest=None,
+                    error="manifest.json is missing",
+                )
+            )
+            continue
+        try:
+            manifest = read_run_manifest(child)
+        except Exception as exc:
+            entries.append(
+                RunDirectoryEntry(
+                    run_id=child.name,
+                    run_dir=child,
+                    manifest=None,
+                    error=str(exc),
+                )
+            )
+            continue
+        if manifest.kind != kind:
+            entries.append(
+                RunDirectoryEntry(
+                    run_id=child.name,
+                    run_dir=child,
+                    manifest=None,
+                    error=(
+                        f"run kind is {manifest.kind!r}, expected {kind!r}"
+                    ),
+                )
+            )
+            continue
+        entries.append(
+            RunDirectoryEntry(
+                run_id=child.name,
+                run_dir=child,
+                manifest=manifest,
+                error=None,
+            )
+        )
+    entries.sort(key=lambda entry: entry.run_id)
+    valid_entries = [
+        entry for entry in entries if entry.manifest is not None
+    ]
+    broken_entries = [
+        entry for entry in entries if entry.manifest is None
+    ]
+    valid_entries.sort(
+        key=lambda entry: entry.created_at or "",
+        reverse=True,
+    )
+    return tuple(valid_entries + broken_entries)
+
+
+def read_run_summary(
+    run_dir: Path, manifest: RunManifest
+) -> Mapping[str, object] | None:
+    """Read the optional archived summary object without rescoring it."""
+    if "summary.json" not in manifest.files:
+        return None
+    path = Path(run_dir) / "summary.json"
+    payload = _read_json_object(path)
+    recorded_run_id = payload.get("run_id")
+    if recorded_run_id is not None and recorded_run_id != manifest.run_id:
+        raise ArtifactCorruptError(
+            "summary run_id does not match the run manifest"
+        )
+    expected_schema = {
+        "development": "baseline_summary_v1",
+        "benchmark": "benchmark_summary_v1",
+    }.get(manifest.kind)
+    if (
+        expected_schema is not None
+        and payload.get("schema_version") != expected_schema
+    ):
+        raise ArtifactSchemaError(
+            f"{manifest.kind} summary must use {expected_schema!r}"
+        )
+    return payload
+
+
+def _validate_outcome_requests(
+    outcomes: Sequence[RecordedOutcome],
+    requests: Mapping[str, RecordedRequest],
+    *,
+    run_id: str,
+) -> None:
+    owners: dict[str, str] = {}
+    for outcome in outcomes:
+        for request_id in outcome.request_ids:
+            request = requests.get(request_id)
+            if request is None:
+                raise ReplayError(
+                    f"outcome {outcome.case_id}/{outcome.phase} references "
+                    f"missing request {request_id!r}"
+                )
+            if request.phase != "task":
+                raise ReplayError(
+                    f"outcome {outcome.case_id}/{outcome.phase} references "
+                    f"non-task request {request_id!r}"
+                )
+            previous = owners.get(request_id)
+            if previous is not None:
+                raise ReplayError(
+                    f"request {request_id!r} in {run_id} is shared by "
+                    f"{previous} and {outcome.case_id}/{outcome.phase}"
+                )
+            owners[request_id] = f"{outcome.case_id}/{outcome.phase}"
+
+
+def open_development_run(
+    run_dir: Path,
+    *,
+    runs_root: Path | None = None,
+    programs_root: Path = PROGRAMS_ROOT,
+) -> RecordedDevelopmentRun:
+    """Validate and read one development run for a read-only screen."""
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise ArtifactNotFoundError(
+            f"development run directory is missing: {run_dir}"
+        )
+    if run_dir.parent.name != "development":
+        raise ReplayError("development run must live under runs/development/")
+    if runs_root is not None and run_dir.parent != Path(runs_root) / "development":
+        raise ReplayError("development run is outside the configured runs root")
+    manifest = read_run_manifest(run_dir)
+    if manifest.kind != "development":
+        raise ReplayError("Replay entrypoint must be a development run")
+    if manifest.links.baseline_program_id is None:
+        raise ArtifactIncompleteError(
+            "development run has no linked baseline program"
+        )
+    verify_file_index(run_dir, manifest.files)
+    cases, rules_text = read_input_snapshot(run_dir, manifest.snapshot)
+    case_by_id = {case.case_id: case for case in cases}
+    outcomes = _read_and_validate_outcomes(
+        run_dir,
+        manifest,
+        case_by_id,
+        rules_text,
+        phases=("development",),
+        program_ids={"development": manifest.links.baseline_program_id},
+        expected_split="validation",
+    )
+    programs: dict[str, ProgramSnapshot] = {}
+    for reference in manifest.programs:
+        snapshot = _read_program_snapshot_for_reference(
+            reference, Path(programs_root)
+        )
+        programs[snapshot.program_id] = snapshot
+    warnings = list(manifest.warnings)
+    if manifest.status != "completed":
+        warnings.append(
+            f"Development run status is {manifest.status!r}; these results "
+            "are not a completed baseline evaluation."
+        )
+    requests: dict[str, RecordedRequest] = {}
+    if RUN_REQUESTS_FILENAME in manifest.files:
+        requests = read_recorded_requests(run_dir / RUN_REQUESTS_FILENAME)
+        _validate_outcome_requests(
+            outcomes, requests, run_id=manifest.run_id
+        )
+    elif any(outcome.request_ids for outcome in outcomes):
+        raise ReplayError(
+            "outcomes reference requests but requests.jsonl is absent"
+        )
+    else:
+        warnings.append(
+            "No request trace file is archived; sent traces are unavailable."
+        )
+    summary = read_run_summary(run_dir, manifest)
+    if summary is None:
+        warnings.append(
+            "Baseline development summary is not archived; aggregate "
+            "metrics and cost status are unavailable."
+        )
+    return RecordedDevelopmentRun(
+        run_dir=run_dir,
+        manifest=manifest,
+        summary=summary,
+        cases=tuple(cases),
+        rules_text=rules_text,
+        programs=programs,
+        outcomes=tuple(outcomes),
+        requests=requests,
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
+def open_optimization_run(
+    run_dir: Path,
+    *,
+    runs_root: Path | None = None,
+    programs_root: Path = PROGRAMS_ROOT,
+) -> RecordedOptimizationRun:
+    """Validate and read one optimization run without executing a program."""
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise ArtifactNotFoundError(
+            f"optimization run directory is missing: {run_dir}"
+        )
+    if run_dir.parent.name != "optimization":
+        raise ReplayError(
+            "optimization run must live under runs/optimization/"
+        )
+    if (
+        runs_root is not None
+        and run_dir.parent != Path(runs_root) / "optimization"
+    ):
+        raise ReplayError(
+            "optimization run is outside the configured runs root"
+        )
+    manifest = read_run_manifest(run_dir)
+    if manifest.kind != "optimization":
+        raise ReplayError("entrypoint must be an optimization run")
+    verify_file_index(run_dir, manifest.files)
+    cases, rules_text = read_input_snapshot(run_dir, manifest.snapshot)
+    warnings = list(manifest.warnings)
+    if manifest.status != "completed":
+        warnings.append(
+            f"Optimization run status is {manifest.status!r}; this is not "
+            "a completed optimization result."
+        )
+    if (
+        manifest.links.optimized_program_id is not None
+        and manifest.links.optimized_program_id
+        == manifest.links.baseline_program_id
+    ):
+        warnings.append(
+            "The selected program is the unchanged baseline; no instruction "
+            "change is recorded."
+        )
+    programs: dict[str, ProgramSnapshot] = {}
+    for reference in manifest.programs:
+        snapshot = _read_program_snapshot_for_reference(
+            reference, Path(programs_root)
+        )
+        programs[snapshot.program_id] = snapshot
+    requests: dict[str, RecordedRequest] = {}
+    if RUN_REQUESTS_FILENAME in manifest.files:
+        requests = read_recorded_requests(run_dir / RUN_REQUESTS_FILENAME)
+    else:
+        warnings.append(
+            "No optimization request trace is archived; reflection and task "
+            "requests are unavailable."
+        )
+    candidate_stats: Mapping[str, object] | None = None
+    if RUN_GEPA_STATS_FILENAME in manifest.files:
+        candidate_stats = _read_json_object(
+            run_dir / RUN_GEPA_STATS_FILENAME
+        )
+        recorded_run_id = candidate_stats.get("run_id")
+        if recorded_run_id is not None and recorded_run_id != manifest.run_id:
+            raise ArtifactCorruptError(
+                "optimization statistics run_id does not match the manifest"
+            )
+    else:
+        warnings.append(
+            "Optimization candidate statistics are not archived."
+        )
+    return RecordedOptimizationRun(
+        run_dir=run_dir,
+        manifest=manifest,
+        cases=tuple(cases),
+        rules_text=rules_text,
+        programs=programs,
+        requests=requests,
+        candidate_stats=candidate_stats,
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
 def open_replay_archive(
     benchmark_dir: Path,
     *,
@@ -2155,8 +2515,38 @@ def open_replay_archive(
         },
         expected_split="test",
     )
+    development_requests: dict[str, RecordedRequest] = {}
+    if RUN_REQUESTS_FILENAME in development.files:
+        development_requests = read_recorded_requests(
+            development_dir / RUN_REQUESTS_FILENAME
+        )
+        _validate_outcome_requests(
+            development_outcomes,
+            development_requests,
+            run_id=development.run_id,
+        )
 
     warnings: list[str] = []
+    if (
+        RUN_REQUESTS_FILENAME not in development.files
+        and any(outcome.request_ids for outcome in development_outcomes)
+    ):
+        warnings.append(
+            "Baseline development request traces are not archived; their "
+            "sent messages are unavailable."
+        )
+    development_summary = read_run_summary(development_dir, development)
+    if development_summary is None:
+        warnings.append(
+            "Baseline development summary is not archived; its historical "
+            "metrics and cost are unavailable."
+        )
+    benchmark_summary = read_run_summary(benchmark_dir, benchmark)
+    if benchmark_summary is None:
+        warnings.append(
+            "Benchmark summary is not archived; original metrics, verdict, "
+            "and historical cost are unavailable."
+        )
     baseline_program_id = benchmark.links.baseline_program_id
     optimized_program_id = benchmark.links.optimized_program_id
     assert baseline_program_id is not None
@@ -2175,6 +2565,34 @@ def open_replay_archive(
                 "Optimized program parent is not the archived baseline; "
                 "full candidate lineage is not archived."
             )
+    optimization_requests: dict[str, RecordedRequest] = {}
+    if RUN_REQUESTS_FILENAME in optimization.files:
+        optimization_requests = read_recorded_requests(
+            optimization_dir / RUN_REQUESTS_FILENAME
+        )
+    else:
+        warnings.append(
+            "Optimization request traces are not archived; reflection "
+            "requests are unavailable."
+        )
+    candidate_stats: Mapping[str, object] | None = None
+    if RUN_GEPA_STATS_FILENAME in optimization.files:
+        stats_payload = _read_json_object(
+            optimization_dir / RUN_GEPA_STATS_FILENAME
+        )
+        recorded_run_id = stats_payload.get("run_id")
+        if (
+            recorded_run_id is not None
+            and recorded_run_id != optimization.run_id
+        ):
+            raise ReplayError(
+                "optimization statistics run_id does not match its manifest"
+            )
+        candidate_stats = stats_payload
+    else:
+        warnings.append(
+            "Optimization candidate statistics are not archived."
+        )
     if benchmark.origin == "mock_test":
         warnings.append(
             "Mock/test archive: this is not a measured experiment."
@@ -2227,17 +2645,6 @@ def open_replay_archive(
             "No request trace file is archived; sent traces are unavailable."
         )
 
-    candidate_stats: Mapping[str, object] | None = None
-    if RUN_GEPA_STATS_FILENAME in optimization.files:
-        stats_payload = _read_json_object(
-            optimization_dir / RUN_GEPA_STATS_FILENAME
-        )
-        candidate_stats = stats_payload
-    else:
-        warnings.append(
-            "Optimization candidate statistics are not archived."
-        )
-
     is_measured = is_measured_archive(benchmark)
     return ReplayArchive(
         benchmark_dir=benchmark_dir,
@@ -2250,10 +2657,16 @@ def open_replay_archive(
         programs=program_snapshots,
         development_outcomes=tuple(development_outcomes),
         outcomes=tuple(outcomes),
+        development_requests=development_requests,
         requests=requests,
+        optimization_requests=optimization_requests,
         candidate_stats=candidate_stats,
+        development_cases=tuple(development_cases),
+        development_rules_text=development_rules_text,
+        development_summary=development_summary,
+        benchmark_summary=benchmark_summary,
         is_measured=is_measured,
-        warnings=tuple(warnings),
+        warnings=tuple(dict.fromkeys(warnings)),
     )
 
 
@@ -2461,10 +2874,13 @@ __all__ = [
     "RUN_MANIFEST_SCHEMA_VERSION",
     "RUN_OUTCOMES_FILENAME",
     "RUN_REQUESTS_FILENAME",
+    "RecordedDevelopmentRun",
+    "RecordedOptimizationRun",
     "RecordedOutcome",
     "RecordedRequest",
     "ReplayArchive",
     "ReplayError",
+    "RunDirectoryEntry",
     "RunLinks",
     "RunManifest",
     "SNAPSHOT_CASES_FILENAME",
@@ -2485,7 +2901,10 @@ __all__ = [
     "format_preview_trace",
     "format_sent_trace",
     "is_measured_archive",
+    "list_run_directories",
     "load_program_artifact",
+    "open_development_run",
+    "open_optimization_run",
     "open_replay_archive",
     "program_reference",
     "read_input_snapshot",
@@ -2494,6 +2913,7 @@ __all__ = [
     "read_recorded_outcomes",
     "read_recorded_requests",
     "read_run_manifest",
+    "read_run_summary",
     "save_program_artifact",
     "scan_tree_for_secrets",
     "sha256_bytes",
