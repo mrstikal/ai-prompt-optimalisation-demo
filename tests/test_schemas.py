@@ -15,6 +15,7 @@ from dspy_lab.schemas import (
     GoldFinding,
     MatchOption,
     ProductFacts,
+    ReviewAuditEntry,
     ReviewRecord,
     SourceRecord,
 )
@@ -320,6 +321,42 @@ def test_case_record_accepts_minimal_case() -> None:
     assert case.gold_findings == []
     assert case.product_facts.mass_g is None
     assert case.sources == []
+    assert case.family_description == ""
+    assert case.is_hard_negative is False
+
+
+def test_case_record_accepts_documented_family_and_clean_hard_negative() -> None:
+    case = CaseRecord.model_validate(
+        {
+            **valid_case(),
+            "family_description": "Documented clean hard negative.",
+            "is_hard_negative": True,
+        }
+    )
+    assert case.family_description == "Documented clean hard negative."
+    assert case.is_hard_negative is True
+
+
+def test_case_record_rejects_hard_negative_with_findings() -> None:
+    with pytest.raises(ValidationError):
+        CaseRecord.model_validate(
+            {
+                **valid_case(),
+                "is_hard_negative": True,
+                "gold_findings": [valid_gold_finding()],
+            }
+        )
+
+
+def test_review_audit_entry_links_a_case_id() -> None:
+    entry = ReviewAuditEntry.model_validate(
+        {"case_id": "train-001", **valid_review()}
+    )
+    assert entry.case_id == "train-001"
+    with pytest.raises(ValidationError):
+        ReviewAuditEntry.model_validate(
+            {"case_id": "Train-001", **valid_review()}
+        )
 
 
 def test_case_record_rejects_duplicate_ids_and_evidence() -> None:
@@ -357,6 +394,7 @@ def test_case_record_rejects_invalid_metadata() -> None:
         {**valid_case(), "rules_version": "editorial_rules_v2"},
         {**valid_case(), "case_id": "Train-001"},
         {**valid_case(), "family_id": "Family Train"},
+        {**valid_case(), "family_description": "   "},
         {**valid_case(), "extra": "forbidden"},
     ):
         with pytest.raises(ValidationError):

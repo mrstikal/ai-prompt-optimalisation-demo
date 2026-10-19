@@ -1,24 +1,37 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
 import pytest
 
 from dspy_lab.config import PROJECT_ROOT
 from dspy_lab.data import (
     TITLE_BODY_SEPARATOR,
+    TRAINING_ARTICLE_COUNT,
+    TRAINING_CODE_COUNT,
+    TRAINING_COMPOSITION,
+    TRAINING_FINDING_COUNT,
     DatasetValidationError,
+    build_coverage_report,
     canonical_document,
     canonical_document_sha256,
     canonicalize_document,
     canonicalize_text,
+    dataset_sha256,
     find_literal_occurrences,
     load_cases,
+    load_review_audit,
+    training_coverage,
     validate_case_offsets,
+    validate_references,
+    validate_review_audit,
+    validate_training_dataset,
 )
 from dspy_lab.schemas import ALLOWED_CODES, CaseRecord
 
 TRAIN_PATH = PROJECT_ROOT / "data/v1/train.jsonl"
+REVIEWS_PATH = PROJECT_ROOT / "data/v1/reviews.jsonl"
+COVERAGE_PATH = PROJECT_ROOT / "data/v1/coverage_report.json"
 RULES_PATH = PROJECT_ROOT / "data/editorial_rules_v1.md"
 
 
@@ -43,22 +56,69 @@ def test_find_literal_occurrences_is_literal_and_includes_overlaps() -> None:
     assert find_literal_occurrences("abc", "") == []
 
 
-def test_five_training_specimens_load_and_cover_all_codes() -> None:
+def test_training_set_has_30_unique_cases() -> None:
     cases = load_cases(TRAIN_PATH)
-    assert len(cases) == 5
-    assert [case.case_id for case in cases] == [
-        "train-001",
-        "train-002",
-        "train-003",
-        "train-004",
-        "train-005",
-    ]
-    assert [len(case.gold_findings) for case in cases] == [0, 2, 2, 2, 1]
-    assert sum(len(case.gold_findings) for case in cases) == 7
-    assert {
-        finding.code for case in cases for finding in case.gold_findings
-    } == set(ALLOWED_CODES)
-    assert cases[0].gold_findings == []
+    assert len(cases) == TRAINING_ARTICLE_COUNT
+    assert len({case.case_id for case in cases}) == TRAINING_ARTICLE_COUNT
+    assert len(
+        {canonical_document_sha256(case) for case in cases}
+    ) == TRAINING_ARTICLE_COUNT
+
+
+def test_training_composition_and_code_coverage() -> None:
+    cases = load_cases(TRAIN_PATH)
+    coverage = training_coverage(cases)
+    assert coverage["article_count"] == TRAINING_ARTICLE_COUNT
+    assert coverage["composition"] == {
+        **TRAINING_COMPOSITION,
+        "more_than_two": 0,
+    }
+    assert coverage["finding_count"] == TRAINING_FINDING_COUNT
+    assert coverage["code_counts"] == {
+        code: TRAINING_CODE_COUNT for code in ALLOWED_CODES
+    }
+    assert len(coverage["clean_cases"]) == 6
+    assert len(coverage["hard_negative_cases"]) >= 3
+    assert coverage["same_code_multi_issue_cases"]
+    validate_training_dataset(cases)
+
+
+def test_training_articles_are_nontrivial_czech_text() -> None:
+    for case in load_cases(TRAIN_PATH):
+        words = len(case.article_text.split())
+        assert words >= 150
+        assert words <= 450
+
+
+def test_training_reviews_and_audit_are_complete() -> None:
+    cases = load_cases(TRAIN_PATH)
+    entries = load_review_audit(REVIEWS_PATH)
+    assert len(entries) == TRAINING_ARTICLE_COUNT
+    validate_review_audit(cases, entries)
+    for case in cases:
+        assert case.review.reconciled is True
+        assert case.review.author_decision == "approved"
+        assert case.review.reviewer_decision == "approved"
+        assert case.review.reviewer_kind == "automated"
+        assert case.review.reviewer_id == "decision-reviewer"
+        assert case.review.reviewed_at is not None
+        assert "Human sign-off remains required" in (
+            case.review.reconciliation_notes
+        )
+
+
+def test_training_references_are_consistent() -> None:
+    for case in load_cases(TRAIN_PATH):
+        validate_references(case)
+
+
+def test_coverage_report_matches_the_training_data() -> None:
+    cases = load_cases(TRAIN_PATH)
+    report = json.loads(COVERAGE_PATH.read_text(encoding="utf-8"))
+    assert report == build_coverage_report(cases)
+    assert report["dataset_sha256"] == dataset_sha256(cases)
+    assert len(report["dataset_sha256"]) == 64
+    assert report["rules_version"] == "editorial_rules_v1"
 
 
 def test_specimen_codes_reflect_precedence_and_non_violations() -> None:
@@ -108,7 +168,7 @@ def test_every_gold_offset_points_at_the_reviewed_evidence() -> None:
 def test_canonical_hashes_are_stable_and_text_sensitive() -> None:
     cases = load_cases(TRAIN_PATH)
     hashes = {canonical_document_sha256(case) for case in cases}
-    assert len(hashes) == 5
+    assert len(hashes) == TRAINING_ARTICLE_COUNT
     assert all(len(value) == 64 for value in hashes)
     modified = cases[0].model_copy(
         update={"article_text": cases[0].article_text + " Navíc."}
@@ -226,11 +286,12 @@ def test_rules_file_documents_the_closed_taxonomy_and_boundaries() -> None:
 
 def test_specimens_live_in_training_not_a_secret_test_set() -> None:
     assert TRAIN_PATH.is_file()
+    assert len(load_cases(TRAIN_PATH)) == TRAINING_ARTICLE_COUNT
     assert not (PROJECT_ROOT / "data/v1/test.jsonl").exists()
     assert not (PROJECT_ROOT / "data/v1/validation.jsonl").exists()
 
 
-def test_every_specimen_has_a_review_record() -> None:
+def test_every_training_case_has_a_review_record() -> None:
     for case in load_cases(TRAIN_PATH):
         assert case.review.author_id
         assert case.review.reviewer_id
@@ -238,7 +299,7 @@ def test_every_specimen_has_a_review_record() -> None:
         assert isinstance(case.review.reconciled, bool)
 
 
-def test_five_specimens_are_reconciled_by_an_independent_review() -> None:
+def test_all_training_cases_are_reconciled_by_an_independent_review() -> None:
     for case in load_cases(TRAIN_PATH):
         assert case.review.reconciled is True
         assert case.review.author_decision == "approved"

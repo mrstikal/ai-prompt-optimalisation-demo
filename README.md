@@ -4,11 +4,12 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1 and S2 implemented.** S1 establishes the isolated Python
+**Status: S1-S3 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
-canonicalization/offset validation, and five training specimens. The full
-50-case dataset, validation/test splits, UI, DSPy program, metrics, provider
+canonicalization/offset validation, and the first five training specimens. S3
+completes the 30-case training set with review audit, family descriptions, and a
+coverage report. The validation/test splits, UI, DSPy program, metrics, provider
 calls, optimization, benchmark, and Replay archive are not implemented. No paid
 API call has been made.
 
@@ -84,31 +85,37 @@ Frozen initial defaults are defined in `src/dspy_lab/config.py`:
 attempt, not only reflection proposals. GEPA's `max_metric_calls` is a separate
 limit. Budget enforcement itself is implemented in S7.
 
-## Editorial contract (S2)
+## Editorial contract (S2-S3)
 
 - `data/editorial_rules_v1.md` is the frozen six-code policy: definitions,
   exclusions, precedence, positive/negative examples, numerical/hypothetical
   boundaries, negation, quotations, citation rules, and evidence limits.
 - `src/dspy_lab/schemas.py` defines strict Pydantic models for model findings,
-  cases, product facts, sources, gold annotations, match options, and review
-  records. Unknown codes, extra fields, wrong types, whitespace-only text, and
-  overlong evidence/explanation values are rejected without coercion.
+  cases, product facts, sources, gold annotations, match options, review
+  records, and review-audit entries. Unknown codes, extra fields, wrong types,
+  whitespace-only text, and overlong evidence/explanation values are rejected
+  without coercion.
 - `src/dspy_lab/data.py` applies NFC, LF, and NBSP/NNBSP normalization, builds
-  the canonical title + blank line + body text, and validates unique literal
-  evidence, half-open code-point anchors/context windows, and the title/body
-  separator.
-- `data/v1/train.jsonl` contains five training specimens covering all six
-  codes, a clean case, a contradicted product fact, a placeholder, a negated
-  guarantee, a hypothetical number, a rejected quotation, and missing or
-  unsupported references. No validation/test file exists yet.
-- Each specimen records an independent automated review by
-  `decision-reviewer`; the rules ambiguities found in review were fixed and
-  verified, with no specimen findings. Human sign-off is still required before
-  these labels become final gold.
+  the canonical title + blank line + body text, validates unique literal
+  evidence, half-open code-point anchors/context windows, the title/body
+  separator, training composition, code coverage, hard negatives, same-code
+  multi-issue cases, reference consistency, and the review audit.
+- `data/v1/train.jsonl` contains 30 training cases: 6 clean, 12 one-issue, and
+  12 two-issue articles with 36 gold findings, exactly six occurrences of each
+  code, four hard negatives, and one same-code multi-issue case. No
+  validation/test file exists yet.
+- `data/v1/reviews.jsonl` contains one approved review-audit entry per training
+  case. `data/v1/coverage_report.json` records composition, code counts, clean
+  and hard-negative cases, same-code multi-issue cases, family descriptions,
+  per-case canonical hashes, and the dataset hash.
+- The training labels have an independent automated review by
+  `decision-reviewer` in three batches. Two unannotated title guarantees were
+  removed and verified, and two related descriptive titles were neutralized.
+  Human sign-off is still required before these labels become final gold.
 
 ```bash
 uv run python -c \
-  "from pathlib import Path; from dspy_lab.data import load_cases; print([c.case_id for c in load_cases(Path('data/v1/train.jsonl'))])"
+  "from pathlib import Path; from dspy_lab.data import load_cases; print(len(load_cases(Path('data/v1/train.jsonl'))))"
 ```
 
 ## Frozen API contracts
@@ -158,12 +165,14 @@ verify the actual Python version, the committed lockfile, genuine GEPA/LiteLLM
 availability, Python 3.15 rejection, configuration validation, secret
 redaction, no network access during package import, strict schema behavior,
 canonicalization, exact evidence offsets, all six codes, precedence and
-non-violations, and training-only placement of the five specimens.
+non-violations, 30-case training composition and code coverage, hard negatives,
+the same-code multi-issue case, reference consistency, review audit, and the
+coverage report.
 
 ## Scope and limitations
 
-S1-S2 do not implement the full 50-case dataset, validation/test splits, the
-Streamlit screens, scoring, DSPy program, budget guard, provider preflight,
+S1-S3 do not implement the 20 validation/test cases, the sealed split manifest,
+the Streamlit screens, scoring, DSPy program, budget guard, provider preflight,
 optimization, benchmark, or Replay archive. Those stages remain in
 `dspy_plan.md` sections 12-15. The host Python 3.15.0 installation is untouched;
 only this project's isolated environment uses 3.14.8.

@@ -1,0 +1,204 @@
+{
+  "article_count": 30,
+  "case_hashes": {
+    "train-001": "7065b9d5d6fe82eeca88a70f4fbf8a50d198ee131090d9a1fa8381483a27d7d6",
+    "train-002": "caf42b8389717325358fdfd7b03cce8ddea6715d75a72fc8d63346c17e894127",
+    "train-003": "0f9fe54a03cae6452b0bd7d87d8ba051da5199e83d9fa041bf4162351a6dacfb",
+    "train-004": "bf7c74078e488e9d43389f75572cdb7e096aff7db39660a76a1a976363f62724",
+    "train-005": "3aeedcb4f29b2dd94fc1686030bb184ff88ffc4fe949d4ccbeb4fcf1e2d73171",
+    "train-006": "1e8a94e48828c6894052c55458d61e347a8ea1f6f09a3a76f1d75c704c591639",
+    "train-007": "ffaaaa74701863a678145611cd0c23828c4a21f3afb3d791e0af61af66522483",
+    "train-008": "3c4768917c5437c6c3012922b2a44f5c01ff6926a718cb312191d5c7965b3c17",
+    "train-009": "2286740d6f46666cc291dde447ea03246e05ffc1807414d63915ecda8c0830d8",
+    "train-010": "6cd54958ede114b2eba1277ed85d09f0fd52fe79bbf52bdbd3f79d6c994ef3bc",
+    "train-011": "905475946876e9461686b2ebba28c1a9720f2e41323d09bd6b2735a498813c4c",
+    "train-012": "c7994eb75b8cbd39b55f386bb24c65a4f3c11ecea6b8a61ce158fc017844f2e1",
+    "train-013": "2a070059e4b5b34b9a0fceaa5448cb194c8df5c5a1152ef8903161101b686ba4",
+    "train-014": "ef4fc125f1db007df5e54693e48bdb0712bfa206b9ba68801d77b99d9e7465d2",
+    "train-015": "2038b99c35a99f15baa8f1a8a93c5447dd438531660a06e44555d72ccb19d4e8",
+    "train-016": "4149ac9d7e0dc7dbd9ef74d8b2c7b23db17604e2e154f72cbdc99b3ce9bf7fe1",
+    "train-017": "830407f0f07c1ed0c9ff89d70bb3de8107daeff32c8b21f64bace18e9562358d",
+    "train-018": "2443d554021836e02f72743368a2edcbebf1570efdc92289671a8a362ec4bed2",
+    "train-019": "4fb8e0e316d4b0e18db7cf3ad064875affc3e0813b137ec9c95fd5000a696650",
+    "train-020": "72aaf44c427eb0087f04466593b00da71f63a3a467fb7829b460aa9c10f4b87c",
+    "train-021": "776c9aa07159575381af7ea14aa626f9ffd5ae9da48aa7b2b50ee1028a8c8a92",
+    "train-022": "dfa7f5cf9a84e8606086e39321ae54188cb5fcb0437005aac73ae50eb6607128",
+    "train-023": "f1e441e89cdbe4ad2f6dfa18d6bb54798170bd9bf4b359b0dd997537f38033cf",
+    "train-024": "866b6bb157558e269da0bfa0553f955424892100ec398653ee6ebc8c8aff5a5c",
+    "train-025": "7f4e947ad6cee4352883be1d020397e52be47b5925c2071d6028ff6d0ad769ae",
+    "train-026": "49a68ea21cc4ca4f3eb37437ef351eabcc60c58305c4423ad0a86b7ec5459992",
+    "train-027": "9ba340292c6ed73dfc595980428f0b183519c13219d9c3862a7e7fa3bdaca2ba",
+    "train-028": "85b151b28ed7398d1af78e69461a41d86ed837bf8d6e60bc33bc2cf86f9782b0",
+    "train-029": "872f64fd99d351b986e88d8be242c4494525d03013ab244273b6c4f1947f380e",
+    "train-030": "c8e64324d210c7db73f183cb4c140c5561fa27b175389e857ad478b6649b21d7"
+  },
+  "clean_cases": [
+    "train-001",
+    "train-006",
+    "train-007",
+    "train-008",
+    "train-009",
+    "train-010"
+  ],
+  "code_counts": {
+    "INVALID_CITATION": 6,
+    "INVESTMENT_ADVICE_AS_FACT": 6,
+    "PRODUCT_FACT_MISMATCH": 6,
+    "UNRESOLVED_PLACEHOLDER": 6,
+    "UNSUPPORTED_NUMERIC_CLAIM": 6,
+    "UNWARRANTED_CERTAINTY": 6
+  },
+  "code_target": {
+    "INVALID_CITATION": 6,
+    "INVESTMENT_ADVICE_AS_FACT": 6,
+    "PRODUCT_FACT_MISMATCH": 6,
+    "UNRESOLVED_PLACEHOLDER": 6,
+    "UNSUPPORTED_NUMERIC_CLAIM": 6,
+    "UNWARRANTED_CERTAINTY": 6
+  },
+  "composition": {
+    "clean": 6,
+    "more_than_two": 0,
+    "one_issue": 12,
+    "two_issues": 12
+  },
+  "composition_target": {
+    "clean": 6,
+    "one_issue": 12,
+    "two_issues": 12
+  },
+  "dataset_sha256": "8792ea0038439359b52a45a2e886088914ae38766be08d7fcfae0e3e014a92b6",
+  "families": [
+    {
+      "description": "Zlatý slitek: podporované údaje, negovaná garance a hypotetický scénář.",
+      "family_id": "family-train-001"
+    },
+    {
+      "description": "Stříbrný slitek: kontradikce hmotnosti a nevyplněná cena.",
+      "family_id": "family-train-002"
+    },
+    {
+      "description": "Investiční tvrzení: univerzální doporučení a garantovaný výnos.",
+      "family_id": "family-train-003"
+    },
+    {
+      "description": "Tržní tvrzení a chybějící certifikát.",
+      "family_id": "family-train-004"
+    },
+    {
+      "description": "Nesprávně připsané doporučení a odmítnutá citace.",
+      "family_id": "family-train-005"
+    },
+    {
+      "description": "Zlatá pamětní mince: podporované parametry, náklad a atribuovaný názor.",
+      "family_id": "family-train-006"
+    },
+    {
+      "description": "Stříbrný slitek: technické parametry a garance fyzikální ryzosti.",
+      "family_id": "family-train-007"
+    },
+    {
+      "description": "Platinová mince: katalogové parametry a sběratelský kontext.",
+      "family_id": "family-train-008"
+    },
+    {
+      "description": "Zlatý dukát: historická novoražba a archivní parametry.",
+      "family_id": "family-train-009"
+    },
+    {
+      "description": "Palladiový slitek: podporovaný tržní údaj a technické parametry.",
+      "family_id": "family-train-010"
+    },
+    {
+      "description": "Zlatý slitek: nepodložený údaj o růstu poptávky.",
+      "family_id": "family-train-011"
+    },
+    {
+      "description": "Stříbrná medaile: univerzální investiční doporučení.",
+      "family_id": "family-train-012"
+    },
+    {
+      "description": "Platinový slitek: slib stálé hodnoty a výnosu.",
+      "family_id": "family-train-013"
+    },
+    {
+      "description": "Zlatá mince: nevyplněný údaj o hmotnosti.",
+      "family_id": "family-train-014"
+    },
+    {
+      "description": "Stříbrný slitek: chybějící certifikační zdroj.",
+      "family_id": "family-train-015"
+    },
+    {
+      "description": "Zlatý slitek: kontradikce hmotnosti proti referenčnímu listu.",
+      "family_id": "family-train-016"
+    },
+    {
+      "description": "Palladiová mince: nepodložený historický cenový údaj.",
+      "family_id": "family-train-017"
+    },
+    {
+      "description": "Zlatý dukát: univerzální investiční doporučení.",
+      "family_id": "family-train-018"
+    },
+    {
+      "description": "Stříbrný slitek: garantované roční zhodnocení.",
+      "family_id": "family-train-019"
+    },
+    {
+      "description": "Platinová medaile: nevyplněný údaj o ceně.",
+      "family_id": "family-train-020"
+    },
+    {
+      "description": "Stříbrná mince: kontradikce ryzosti.",
+      "family_id": "family-train-021"
+    },
+    {
+      "description": "Zlatá mince: nepodložená poptávka a univerzální doporučení.",
+      "family_id": "family-train-022"
+    },
+    {
+      "description": "Stříbrný slitek: garance výnosu a kontradikce hmotnosti.",
+      "family_id": "family-train-023"
+    },
+    {
+      "description": "Platinová mince: chybějící zdroj a kontradikce hmotnosti.",
+      "family_id": "family-train-024"
+    },
+    {
+      "description": "Zlatý slitek: nepodložený cenový růst a garance budoucího růstu.",
+      "family_id": "family-train-025"
+    },
+    {
+      "description": "Stříbrná medaile: univerzální doporučení a nesprávná atribuce.",
+      "family_id": "family-train-026"
+    },
+    {
+      "description": "Palladiový slitek: chybějící zdroj a kontradikce průměru.",
+      "family_id": "family-train-027"
+    },
+    {
+      "description": "Zlatá mince: nepodložený prodej a univerzální doporučení.",
+      "family_id": "family-train-028"
+    },
+    {
+      "description": "Stříbrný slitek: nevyplněná hmotnost a garantovaný výnos.",
+      "family_id": "family-train-029"
+    },
+    {
+      "description": "Platinová medaile: dva samostatné placeholdery stejného typu.",
+      "family_id": "family-train-030"
+    }
+  ],
+  "finding_count": 36,
+  "hard_negative_cases": [
+    "train-001",
+    "train-006",
+    "train-007",
+    "train-010"
+  ],
+  "rules_version": "editorial_rules_v1",
+  "same_code_multi_issue_cases": [
+    "train-030"
+  ]
+}

@@ -260,6 +260,8 @@ class CaseRecord(BaseModel):
     family_id: str = Field(
         min_length=1, max_length=64, pattern=CASE_ID_PATTERN
     )
+    family_description: str = Field(default="", max_length=300)
+    is_hard_negative: bool = False
     title: str = Field(min_length=1, max_length=300)
     article_text: str = Field(min_length=1, max_length=20_000)
     product_facts: ProductFacts = Field(default_factory=ProductFacts)
@@ -267,6 +269,17 @@ class CaseRecord(BaseModel):
     rules_version: Literal["editorial_rules_v1"]
     gold_findings: list[GoldFinding] = Field(default_factory=list)
     review: ReviewRecord
+
+    @field_validator("family_description")
+    @classmethod
+    def _family_description_empty_or_non_whitespace(
+        cls, value: str
+    ) -> str:
+        if value and not value.strip():
+            raise ValueError(
+                "family_description must be empty or non-whitespace"
+            )
+        return value
 
     @field_validator("title")
     @classmethod
@@ -294,7 +307,17 @@ class CaseRecord(BaseModel):
             raise ValueError(
                 "gold evidence quotes must be unique within a case"
             )
+        if self.is_hard_negative and self.gold_findings:
+            raise ValueError("a hard negative must have no gold findings")
         return self
+
+
+class ReviewAuditEntry(ReviewRecord):
+    """One reviews.jsonl entry linked to a case ID."""
+
+    case_id: str = Field(
+        min_length=1, max_length=64, pattern=CASE_ID_PATTERN
+    )
 
 
 __all__ = [
@@ -310,6 +333,7 @@ __all__ = [
     "MatchOption",
     "ProductFacts",
     "RULES_VERSION",
+    "ReviewAuditEntry",
     "ReviewRecord",
     "SOURCE_ID_PATTERN",
     "SourceRecord",
