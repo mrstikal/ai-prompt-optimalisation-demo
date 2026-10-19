@@ -4,15 +4,18 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S4 implemented.** S1 establishes the isolated Python
+**Status: S1-S5 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
 completes the 30-case training set with review audit, family descriptions, and a
 coverage report. S4 adds 10 validation and 10 held-out test cases, a frozen split
-manifest, family/near-duplicate checks, and a 50-entry review audit. The UI,
-DSPy program, metrics, provider calls, optimization, benchmark, and Replay
-archive are not implemented. No paid API call has been made.
+manifest, family/near-duplicate checks, and a 50-entry review audit. S5 adds the
+deterministic evidence matcher, corpus and per-category metrics, clean-case
+reward, and the scalar/GEPA feedback interfaces, backed by hand-computed unit
+fixtures and dataset-level self-match checks. The UI, DSPy program, provider
+calls, optimization, benchmark, and Replay archive are not implemented. No paid
+API call has been made.
 
 ## Requirements
 
@@ -175,12 +178,15 @@ canonicalization, exact evidence offsets, all six codes, precedence and
 non-violations, 30/10/10 split composition and code coverage, hard negatives,
 the same-code multi-issue case, reference consistency, family and hash
 disjointness, near-duplicate checks, the 50-entry review audit, the frozen split
-manifest, and rejection of the sealed test path by the optimization loader.
+manifest, deterministic scoring and maximum-cardinality matching, duplicate and
+evidence-failure accounting, undefined-ratio behavior, scalar/GEPA wrapper
+agreement, and rejection of the sealed test path by the optimization loader.
 
 ## Scope and limitations
 
-S1-S4 complete the 50-case dataset and seal the held-out test split. They do not
-implement the Streamlit screens, scoring, DSPy program, budget guard, provider
-preflight, optimization, benchmark, or Replay archive. Those stages remain in
-`dspy_plan.md` sections 12-15. The host Python 3.15.0 installation is untouched;
-only this project's isolated environment uses 3.14.8.
+S1-S5 complete the 50-case dataset, seal the held-out test split, and provide
+deterministic scoring and GEPA feedback. They do not implement the Streamlit
+screens, DSPy program, budget guard, provider preflight, optimization, benchmark,
+or Replay archive. Those stages remain in `dspy_plan.md` sections 12-15. The host
+Python 3.15.0 installation is untouched; only this project's isolated
+environment uses 3.14.8.
