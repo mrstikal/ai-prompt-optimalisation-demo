@@ -4,7 +4,7 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S9 implemented.** S1 establishes the isolated Python
+**Status: S1-S10 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
@@ -24,9 +24,12 @@ single-provider routing, public endpoint-catalog snapshots, an explicitly
 confirmed three-call compatibility preflight, and local JSON preflight records.
 S9 adds atomic state-only program artifacts, linked development/optimization/
 benchmark run manifests with exact case/rule snapshots, a strictly offline
-Replay reader, and shared sent-versus-preview trace formatting. The Streamlit
-UI, optimization, and benchmark engine are not implemented. No paid API call
-has been made.
+Replay reader, and shared sent-versus-preview trace formatting. S10 adds the
+separately confirmed baseline validation evaluation and genuine GEPA compile
+paths, complete native candidate statistics, request/response/event
+persistence, linked development/optimization run records, and selected-program
+serialization. The Streamlit UI and benchmark engine are not implemented. No
+paid API call has been made.
 
 ## Requirements
 
@@ -234,6 +237,33 @@ reservation does not fit the cap. Catalog metadata requests are public and
 cost no tokens, but they do require network access. Do not run the command
 until the separate preflight budget has been approved.
 
+## Baseline Development and GEPA (S10)
+
+- `run_baseline_development()` evaluates the frozen zero-demo baseline once on
+  the supplied validation cases under a separate explicit confirmation. The
+  default budget is 10 admitted calls and 0.50 USD. Every case receives a
+  recorded outcome, including parse/request errors and cases not reached after a
+  budget stop; per-case cost and request IDs stay visible. The summary also
+  labels the always-empty reward as a calculated reference, not a model run.
+- `run_optimization()` requires a separate confirmation and a completed linked
+  baseline development run with the same frozen baseline program, rules,
+  validation snapshot, metric version, and task model/request protocol. It
+  reserves one-third of the metric target as admitted-call headroom, capped at
+  40 slots (the default 120/160 configuration gives exactly 40), while the
+  ledger cap remains authoritative for any final-batch overhang.
+- The compile uses the real `dspy.GEPA` with the shared feedback metric, seed
+  42, one thread, zero demos, no merges, and a unique native log directory. The
+  baseline object and artifact are checked for immutability. A fresh copy is
+  optimized; task and reflection calls share one ledger.
+- Requests and raw responses are persisted as they complete. `gepa_stats.json`
+  keeps the complete native `DspyGEPAResult.to_dict()` payload, candidate
+  instructions, lineage, validation scores, discovery counts, and the observed
+  metric/task/reflection counts. Successful runs save the selected state-only
+  program with baseline lineage and round-trip it before the manifest is
+  written. An unchanged baseline may win; it is linked without a duplicate
+  artifact. Perfect-baseline skips and all-proposal failures are labeled
+  explicitly, and budget-stopped or failed compiles are never marked completed.
+
 ## Artifacts and Replay (S9)
 
 - Programs are saved under `artifacts/programs/<program_id>/` as
@@ -348,18 +378,24 @@ preflight plan, failure records without retries, preflight budget enforcement,
 state-only program identity/load compatibility, runtime LM reattachment,
 atomic/secret-safe artifacts, linked run and snapshot consistency, offline
 Replay without LM/native loading or current-dataset substitution, mock archive
-labeling, and sent-versus-preview trace separation.
+labeling, sent-versus-preview trace separation, ten-case baseline outcome and
+budget retention, separate phase confirmations, fixed task-protocol linkage,
+baseline immutability, zero demos, genuine offline GEPA candidate discovery,
+native statistics and proposal/call capture, selected-program round-trip,
+unchanged-baseline and perfect-skip labeling, and stopped/failed compile
+records.
 
 ## Scope and limitations
 
-S1-S9 complete the 50-case dataset, seal the held-out test split, provide
+S1-S10 complete the 50-case dataset, seal the held-out test split, provide
 deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
 with a strict adapter, add the strict-budget guarded LM/ledger, implement the
-explicitly authorized provider preflight with local records, and add safe
-program/run persistence with a read-only Replay reader. They do not implement
-the Streamlit screens, optimization, benchmark engine, or Replay presentation.
-Those stages remain in `dspy_plan.md` sections 12-15. No live preflight,
-optimization, benchmark, or released archive exists, and no paid API call has
-been made. The host
+explicitly authorized provider preflight with local records, add safe
+program/run persistence with a read-only Replay reader, and implement the
+separately confirmed baseline validation and genuine GEPA compile paths. They
+do not implement the Streamlit screens, benchmark engine, or Replay
+presentation. Those stages remain in `dspy_plan.md` sections 12-15. No live
+preflight, optimization, benchmark, or released archive exists, and no paid API
+call has been made. The host
 Python 3.15.0 installation is untouched; only this project's isolated
 environment uses 3.14.8.

@@ -894,6 +894,7 @@ class RecordedRequest(BaseModel):
     usage: dict[str, object]
     started_at: datetime
     finished_at: datetime | None = None
+    response_text: str | None = None
 
     @field_validator(
         "reserved_cost_usd",
@@ -1012,6 +1013,7 @@ class SentTrace(BaseModel):
     cost_status: str | None = None
     status: str
     finish_reason: str | None = None
+    response_text: str | None = None
 
 
 class PreviewTrace(BaseModel):
@@ -1895,6 +1897,11 @@ def format_sent_trace(record: object) -> SentTrace:
             None
             if data.get("finish_reason") is None
             else str(data.get("finish_reason"))
+        ),
+        response_text=(
+            None
+            if data.get("response_text") is None
+            else str(data.get("response_text"))
         ),
     )
 

@@ -10,6 +10,7 @@ failures, and the ledger remains stopped after a stop.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -271,6 +272,33 @@ def sanitize_request_kwargs(
     }
 
 
+def conservative_token_counter(
+    *,
+    prompt: object = None,
+    messages: object = None,
+    request_kwargs: Mapping[str, object] | None = None,
+) -> int:
+    """Return a conservative upper bound on input tokens from UTF-8 bytes.
+
+    A byte-level bound avoids claiming tokenizer fidelity that this project
+    does not have. UTF-8 bytes are an upper bound on BPE-style token counts for
+    the transmitted text, and the serialized request shape adds extra headroom.
+    """
+    payload = {
+        "prompt": prompt,
+        "messages": messages,
+        "request_kwargs": request_kwargs or {},
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return len(serialized.encode("utf-8"))
+
+
 def _serialize_response_format(value: object) -> object:
     """Record the strict wire schema DSPy sends for a native format."""
     if isinstance(value, type) and issubclass(value, BaseModel):
@@ -501,6 +529,7 @@ class RequestRecord:
     usage: Mapping[str, object]
     started_at: datetime
     finished_at: datetime | None
+    response_text: str | None = None
 
 
 @dataclass(slots=True)
@@ -529,6 +558,7 @@ class _RequestState:
     usage: dict[str, object]
     started_at: datetime
     finished_at: datetime | None
+    response_text: str | None = None
 
     def freeze(self) -> RequestRecord:
         return RequestRecord(
@@ -558,6 +588,7 @@ class _RequestState:
             usage=copy.deepcopy(self.usage),
             started_at=self.started_at,
             finished_at=self.finished_at,
+            response_text=self.response_text,
         )
 
 
@@ -742,6 +773,7 @@ class BudgetLedger:
                 usage={},
                 started_at=datetime.now(timezone.utc),
                 finished_at=None,
+                response_text=None,
             )
             self._next_sequence += 1
             self._records.append(state)
@@ -768,6 +800,7 @@ class BudgetLedger:
         response_model: str | None = None,
         finish_reason: str | None = None,
         usage: Mapping[str, object] | None = None,
+        response_text: str | None = None,
     ) -> None:
         cost = _optional_decimal(reported_cost_usd)
         with self._lock:
@@ -785,6 +818,7 @@ class BudgetLedger:
                 response_model=response_model,
                 finish_reason=finish_reason,
                 usage=usage,
+                response_text=response_text,
             )
             if cost is None:
                 state.status = "pending"
@@ -922,7 +956,10 @@ class BudgetLedger:
         response_model: str | None,
         finish_reason: str | None,
         usage: Mapping[str, object] | None,
+        response_text: str | None = None,
     ) -> None:
+        if response_text is not None:
+            state.response_text = str(response_text)
         if input_tokens is not None:
             state.input_tokens = _optional_nonnegative_int(input_tokens)
         if output_tokens is not None:
@@ -1007,6 +1044,7 @@ class GuardedLM(dspy.LM):
         phase: str = "task",
         token_counter: Callable[..., int] | None = None,
         formatting_overhead_tokens: int = 0,
+        record_listener: Callable[[RequestRecord], None] | None = None,
         temperature: float | None = 0.0,
         **kwargs: Any,
     ) -> None:
@@ -1069,6 +1107,10 @@ class GuardedLM(dspy.LM):
         if token_counter is not None and not callable(token_counter):
             raise BudgetConfigurationError(
                 "token_counter must be callable or None"
+            )
+        if record_listener is not None and not callable(record_listener):
+            raise BudgetConfigurationError(
+                "record_listener must be callable or None"
             )
         if "engine" in kwargs:
             engine = kwargs.pop("engine")
@@ -1144,6 +1186,7 @@ class GuardedLM(dspy.LM):
         self._phase = phase
         self._token_counter = token_counter
         self._formatting_overhead_tokens = formatting_overhead_tokens
+        self._record_listener = record_listener
         self._routing_options = copy.deepcopy(kwargs.get("extra_body"))
         self._call_lock = threading.Lock()
         self._secret_values = tuple(
@@ -1241,6 +1284,7 @@ class GuardedLM(dspy.LM):
                 reservation.call_id,
                 reason="cancelled before dispatch",
             )
+            self._notify(reservation.call_id)
             raise BudgetCancelled(
                 "budget cancelled before dispatch",
                 self._ledger.snapshot(),
@@ -1259,12 +1303,14 @@ class GuardedLM(dspy.LM):
                     reservation.call_id,
                     error=error,
                 )
+                self._notify(reservation.call_id)
                 raise
             if len(self.history) <= before:
                 self._ledger.mark_pending(
                     reservation.call_id,
                     error="no LM history record was produced",
                 )
+                self._notify(reservation.call_id)
                 return result
             record = self.history[-1]
             usage = record.get("usage") or {}
@@ -1285,8 +1331,29 @@ class GuardedLM(dspy.LM):
                     record.get("response")
                 ),
                 usage=usage,
+                response_text=self._response_text(result),
             )
+            self._notify(reservation.call_id)
             return result
+
+    def _notify(self, call_id: str) -> None:
+        if self._record_listener is None:
+            return
+        self._record_listener(self._ledger.record(call_id))
+
+    def _response_text(self, result: object) -> str | None:
+        item: object = result
+        if isinstance(item, list):
+            if not item:
+                return None
+            item = item[0]
+        if isinstance(item, str):
+            return self._sanitize_text(item)
+        if isinstance(item, Mapping):
+            text = item.get("text")
+            if isinstance(text, str):
+                return self._sanitize_text(text)
+        return None
 
     def _validated_kwargs(
         self, kwargs: Mapping[str, object]
@@ -1517,6 +1584,9 @@ def build_guarded_lm(
     *,
     role: ProviderRole,
     ledger: BudgetLedger,
+    token_counter: Callable[..., int] | None = None,
+    formatting_overhead_tokens: int = 0,
+    record_listener: Callable[[RequestRecord], None] | None = None,
 ) -> GuardedLM:
     """Build a real guarded LM for the selected task or reflection role."""
     if settings.mode != "live":
@@ -1540,6 +1610,9 @@ def build_guarded_lm(
         api_key=settings.openrouter_api_key,
         temperature=temperature,
         timeout=settings.request_timeout_seconds,
+        token_counter=token_counter,
+        formatting_overhead_tokens=formatting_overhead_tokens,
+        record_listener=record_listener,
     )
 
 
@@ -1560,6 +1633,7 @@ __all__ = [
     "SchemaMode",
     "StopReason",
     "build_guarded_lm",
+    "conservative_token_counter",
     "model_route_for",
     "openrouter_provider_options",
     "sanitize_request_kwargs",
