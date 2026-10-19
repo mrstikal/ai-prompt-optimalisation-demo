@@ -191,11 +191,14 @@ def test_gitignore_protects_secrets_and_local_run_artifacts() -> None:
 
 def test_readme_documents_setup_and_stage_status() -> None:
     text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Status: S1-S3 implemented" in text
+    assert "Status: S1-S4 implemented" in text
     assert "uv python install 3.14.8" in text
     assert "uv sync --frozen" in text
     assert "3.14.8" in text
     assert "data/editorial_rules_v1.md" in text
     assert "data/v1/train.jsonl" in text
+    assert "data/v1/validation.jsonl" in text
+    assert "data/v1/test.jsonl" in text
+    assert "data/v1/split_manifest.json" in text
     assert "data/v1/reviews.jsonl" in text
     assert "data/v1/coverage_report.json" in text

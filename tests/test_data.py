@@ -30,8 +30,11 @@ from dspy_lab.data import (
 from dspy_lab.schemas import ALLOWED_CODES, CaseRecord
 
 TRAIN_PATH = PROJECT_ROOT / "data/v1/train.jsonl"
+VALIDATION_PATH = PROJECT_ROOT / "data/v1/validation.jsonl"
+TEST_PATH = PROJECT_ROOT / "data/v1/test.jsonl"
 REVIEWS_PATH = PROJECT_ROOT / "data/v1/reviews.jsonl"
 COVERAGE_PATH = PROJECT_ROOT / "data/v1/coverage_report.json"
+MANIFEST_PATH = PROJECT_ROOT / "data/v1/split_manifest.json"
 RULES_PATH = PROJECT_ROOT / "data/editorial_rules_v1.md"
 
 
@@ -92,7 +95,12 @@ def test_training_articles_are_nontrivial_czech_text() -> None:
 
 def test_training_reviews_and_audit_are_complete() -> None:
     cases = load_cases(TRAIN_PATH)
-    entries = load_review_audit(REVIEWS_PATH)
+    train_ids = {case.case_id for case in cases}
+    entries = [
+        entry
+        for entry in load_review_audit(REVIEWS_PATH)
+        if entry.case_id in train_ids
+    ]
     assert len(entries) == TRAINING_ARTICLE_COUNT
     validate_review_audit(cases, entries)
     for case in cases:
@@ -284,11 +292,16 @@ def test_rules_file_documents_the_closed_taxonomy_and_boundaries() -> None:
         assert phrase in lowered
 
 
-def test_specimens_live_in_training_not_a_secret_test_set() -> None:
-    assert TRAIN_PATH.is_file()
-    assert len(load_cases(TRAIN_PATH)) == TRAINING_ARTICLE_COUNT
-    assert not (PROJECT_ROOT / "data/v1/test.jsonl").exists()
-    assert not (PROJECT_ROOT / "data/v1/validation.jsonl").exists()
+def test_training_cases_are_disjoint_from_evaluation_splits() -> None:
+    train_ids = {case.case_id for case in load_cases(TRAIN_PATH)}
+    validation_ids = {
+        case.case_id for case in load_cases(VALIDATION_PATH)
+    }
+    test_ids = {case.case_id for case in load_cases(TEST_PATH)}
+    assert len(train_ids) == TRAINING_ARTICLE_COUNT
+    assert train_ids.isdisjoint(validation_ids)
+    assert train_ids.isdisjoint(test_ids)
+    assert validation_ids.isdisjoint(test_ids)
 
 
 def test_every_training_case_has_a_review_record() -> None:

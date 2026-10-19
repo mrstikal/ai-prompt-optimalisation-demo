@@ -4,14 +4,15 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S3 implemented.** S1 establishes the isolated Python
+**Status: S1-S4 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
 completes the 30-case training set with review audit, family descriptions, and a
-coverage report. The validation/test splits, UI, DSPy program, metrics, provider
-calls, optimization, benchmark, and Replay archive are not implemented. No paid
-API call has been made.
+coverage report. S4 adds 10 validation and 10 held-out test cases, a frozen split
+manifest, family/near-duplicate checks, and a 50-entry review audit. The UI,
+DSPy program, metrics, provider calls, optimization, benchmark, and Replay
+archive are not implemented. No paid API call has been made.
 
 ## Requirements
 
@@ -85,7 +86,7 @@ Frozen initial defaults are defined in `src/dspy_lab/config.py`:
 attempt, not only reflection proposals. GEPA's `max_metric_calls` is a separate
 limit. Budget enforcement itself is implemented in S7.
 
-## Editorial contract (S2-S3)
+## Dataset contract (S2-S4)
 
 - `data/editorial_rules_v1.md` is the frozen six-code policy: definitions,
   exclusions, precedence, positive/negative examples, numerical/hypothetical
@@ -98,24 +99,30 @@ limit. Budget enforcement itself is implemented in S7.
 - `src/dspy_lab/data.py` applies NFC, LF, and NBSP/NNBSP normalization, builds
   the canonical title + blank line + body text, validates unique literal
   evidence, half-open code-point anchors/context windows, the title/body
-  separator, training composition, code coverage, hard negatives, same-code
-  multi-issue cases, reference consistency, and the review audit.
+  separator, split composition, code coverage, hard negatives, same-code
+  multi-issue cases, reference consistency, family disjointness, near-duplicate
+  flags, review audit, and dataset hashes.
 - `data/v1/train.jsonl` contains 30 training cases: 6 clean, 12 one-issue, and
   12 two-issue articles with 36 gold findings, exactly six occurrences of each
-  code, four hard negatives, and one same-code multi-issue case. No
-  validation/test file exists yet.
-- `data/v1/reviews.jsonl` contains one approved review-audit entry per training
-  case. `data/v1/coverage_report.json` records composition, code counts, clean
-  and hard-negative cases, same-code multi-issue cases, family descriptions,
-  per-case canonical hashes, and the dataset hash.
-- The training labels have an independent automated review by
-  `decision-reviewer` in three batches. Two unannotated title guarantees were
+  code, four hard negatives, and one same-code multi-issue case.
+- `data/v1/validation.jsonl` and `data/v1/test.jsonl` contain 10 cases each:
+  2 clean, 4 one-issue, and 4 two-issue articles with 12 gold findings and
+  exactly two occurrences of each code per split. The test split is sealed for
+  optimization.
+- `data/v1/split_manifest.json` freezes the 30/10/10 counts, family
+  assignments, per-file and combined hashes, and the near-duplicate report.
+  `data/v1/coverage_report.json` records the training-only coverage report.
+  `data/v1/reviews.jsonl` contains one approved review-audit entry per case.
+- The labels have an independent automated review by `decision-reviewer`.
+  Training was reviewed in three batches; two unannotated title guarantees were
   removed and verified, and two related descriptive titles were neutralized.
-  Human sign-off is still required before these labels become final gold.
+  The validation/test split review is recorded in the review audit, and the
+  final manifest audit was completed before freezing. Human sign-off is still
+  required before final gold and before the held-out run.
 
 ```bash
 uv run python -c \
-  "from pathlib import Path; from dspy_lab.data import load_cases; print(len(load_cases(Path('data/v1/train.jsonl'))))"
+  "from pathlib import Path; from dspy_lab.data import load_all_splits; print({k: len(v) for k, v in load_all_splits(Path('data/v1')).items()})"
 ```
 
 ## Frozen API contracts
@@ -165,14 +172,15 @@ verify the actual Python version, the committed lockfile, genuine GEPA/LiteLLM
 availability, Python 3.15 rejection, configuration validation, secret
 redaction, no network access during package import, strict schema behavior,
 canonicalization, exact evidence offsets, all six codes, precedence and
-non-violations, 30-case training composition and code coverage, hard negatives,
-the same-code multi-issue case, reference consistency, review audit, and the
-coverage report.
+non-violations, 30/10/10 split composition and code coverage, hard negatives,
+the same-code multi-issue case, reference consistency, family and hash
+disjointness, near-duplicate checks, the 50-entry review audit, the frozen split
+manifest, and rejection of the sealed test path by the optimization loader.
 
 ## Scope and limitations
 
-S1-S3 do not implement the 20 validation/test cases, the sealed split manifest,
-the Streamlit screens, scoring, DSPy program, budget guard, provider preflight,
-optimization, benchmark, or Replay archive. Those stages remain in
+S1-S4 complete the 50-case dataset and seal the held-out test split. They do not
+implement the Streamlit screens, scoring, DSPy program, budget guard, provider
+preflight, optimization, benchmark, or Replay archive. Those stages remain in
 `dspy_plan.md` sections 12-15. The host Python 3.15.0 installation is untouched;
 only this project's isolated environment uses 3.14.8.
