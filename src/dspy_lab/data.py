@@ -822,6 +822,59 @@ def load_all_splits(
     }
 
 
+def load_benchmark_cases(base_dir: Path) -> list[CaseRecord]:
+    """Load the sealed test split for an explicitly authorized benchmark.
+
+    This is the only test-data loader. Optimization code must use
+    ``load_optimization_cases`` and never call this function.
+    """
+    base = Path(base_dir)
+    manifest_path = base / "split_manifest.json"
+    test_path = base / "test.jsonl"
+    if not manifest_path.is_file():
+        raise DatasetValidationError(
+            "benchmark loader requires the frozen split manifest"
+        )
+    if not test_path.is_file():
+        raise DatasetValidationError("benchmark loader requires test.jsonl")
+    manifest = load_split_manifest(manifest_path)
+    if manifest.get("test_sealed") is not True:
+        raise DatasetValidationError("split manifest does not seal the test split")
+    if manifest.get("rules_version") != RULES_VERSION:
+        raise DatasetValidationError(
+            "split manifest uses an unsupported rules version"
+        )
+    splits = manifest.get("splits")
+    if not isinstance(splits, Mapping):
+        raise DatasetValidationError("split manifest has no test metadata")
+    test_meta = splits.get("test")
+    if not isinstance(test_meta, Mapping):
+        raise DatasetValidationError("split manifest has no test entry")
+    expected_hash = test_meta.get("file_sha256")
+    if not isinstance(expected_hash, str) or file_sha256(test_path) != expected_hash:
+        raise DatasetValidationError(
+            "test.jsonl does not match the frozen split manifest hash"
+        )
+    cases = load_cases(test_path)
+    expected_ids = test_meta.get("case_ids")
+    expected_families = test_meta.get("family_ids")
+    if expected_ids is not None and list(expected_ids) != [
+        case.case_id for case in cases
+    ]:
+        raise DatasetValidationError(
+            "test.jsonl case IDs do not match the frozen split manifest"
+        )
+    if expected_families is not None and list(expected_families) != [
+        case.family_id for case in cases
+    ]:
+        raise DatasetValidationError(
+            "test.jsonl families do not match the frozen split manifest"
+        )
+    if any(case.rules_version != RULES_VERSION for case in cases):
+        raise DatasetValidationError("test cases use an unsupported rules version")
+    return cases
+
+
 def load_optimization_cases(
     train_path: Path, validation_path: Path
 ) -> dict[str, list[CaseRecord]]:
@@ -868,6 +921,7 @@ __all__ = [
     "five_word_shingles",
     "jaccard_similarity",
     "load_all_splits",
+    "load_benchmark_cases",
     "load_cases",
     "load_optimization_cases",
     "load_review_audit",

@@ -687,6 +687,9 @@ class BenchmarkProtocol(BaseModel):
 
     exposure_index: int = Field(ge=0)
     paired_order: list[Literal["baseline", "optimized"]]
+    case_orders: dict[str, list[Literal["baseline", "optimized"]]] = (
+        Field(default_factory=dict)
+    )
     seed: int | None = None
     protocol_sha256: str = Field(pattern=_PATTERN_SHA256)
     released: bool
@@ -701,6 +704,19 @@ class BenchmarkProtocol(BaseModel):
             raise ValueError(
                 "paired_order must contain baseline and optimized exactly once"
             )
+        for case_id, order in self.case_orders.items():
+            if re.fullmatch(r"^[a-z0-9][a-z0-9-]*$", case_id) is None:
+                raise ValueError(
+                    f"case_orders contains an invalid case ID {case_id!r}"
+                )
+            if len(order) != 2 or set(order) != {
+                "baseline",
+                "optimized",
+            }:
+                raise ValueError(
+                    "every case order must contain baseline and optimized "
+                    "exactly once"
+                )
         return self
 
 
@@ -1573,6 +1589,18 @@ def _case_json_payload(case: CaseRecord) -> dict[str, object]:
     return payload
 
 
+def cases_snapshot_sha256(cases: Sequence[CaseRecord]) -> str:
+    """Return the exact ordered JSONL hash used by input snapshots."""
+    case_ids = [case.case_id for case in cases]
+    if len(case_ids) != len(set(case_ids)):
+        raise ArtifactError("snapshot case IDs must be unique")
+    cases_text = "".join(
+        canonical_json_text(_case_json_payload(case)) + "\n"
+        for case in cases
+    )
+    return sha256_bytes(cases_text.encode("utf-8"))
+
+
 def write_input_snapshot(
     directory: Path,
     *,
@@ -1597,6 +1625,8 @@ def write_input_snapshot(
         for case in cases
     )
     cases_bytes = cases_text.encode("utf-8")
+    if cases_snapshot_sha256(cases) != sha256_bytes(cases_bytes):
+        raise ArtifactError("snapshot case hash helper is inconsistent")
     rules_bytes = rules_text.encode("utf-8")
     atomic_write_bytes(
         directory / SNAPSHOT_CASES_FILENAME, cases_bytes
@@ -2450,6 +2480,7 @@ __all__ = [
     "canonical_json_bytes",
     "canonical_json_text",
     "case_input_sha256",
+    "cases_snapshot_sha256",
     "file_index",
     "format_preview_trace",
     "format_sent_trace",

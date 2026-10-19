@@ -4,7 +4,7 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S10 implemented.** S1 establishes the isolated Python
+**Status: S1-S11 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
@@ -28,8 +28,12 @@ Replay reader, and shared sent-versus-preview trace formatting. S10 adds the
 separately confirmed baseline validation evaluation and genuine GEPA compile
 paths, complete native candidate statistics, request/response/event
 persistence, linked development/optimization run records, and selected-program
-serialization. The Streamlit UI and benchmark engine are not implemented. No
-paid API call has been made.
+serialization. S11 adds the separately confirmed paired benchmark engine,
+sealed test snapshots, deterministic per-case A/B and B/A ordering, exact
+per-arm predictions/errors/metrics, micro-versus-mean metrics, cost and
+latency summaries, cost-only break-even economics, validity/completeness
+gates, and test-reuse exposure history. The Streamlit UI and Replay
+presentation are not implemented. No paid API call has been made.
 
 ## Requirements
 
@@ -264,6 +268,43 @@ until the separate preflight budget has been approved.
   artifact. Perfect-baseline skips and all-proposal failures are labeled
   explicitly, and budget-stopped or failed compiles are never marked completed.
 
+## Paired Benchmark (S11)
+
+- `load_sealed_benchmark_cases()` is the only test-split loader; optimization
+  never calls it. The production split manifest hash, case IDs, and families are
+  checked before the ten test cases are returned.
+- `run_benchmark()` requires its own explicit confirmation and phase budget. It
+  loads the baseline program linked by the completed development run and the
+  exact selected program linked by the completed optimization run. It never
+  invokes GEPA or saves a program; tests patch both paths to fail and still
+  exercise the real saved-program inference path.
+- Each test case is evaluated through `dspy.Evaluate` on a one-case devset with
+  `scalar_metric`, one thread, no retries, no cache, and the frozen task
+  protocol. Arm order is randomized per case from the stored seed; both orders,
+  byte-identical inputs, and equal task-config fingerprints are archived.
+  Every attempted arm produces an outcome, including parse/request errors and
+  raw responses. A stop before all planned arms is `stopped` and incomplete;
+  all attempts with one or more errors is `completed` but fails the validity
+  gate.
+- The summary reports raw TP/FP/FN, Precision, Recall, corpus micro-F1,
+  macro-F1, exact-match count/rate, parsing success, corrected/regressed cases,
+  per-category support and regressions, both `dspy.Evaluate` rounded
+  percentages and unrounded mean-case reward, token totals, cost per attempted
+  article with actual/estimated status, separate task-train, task-validation,
+  reflection, and inference costs, and latency in milliseconds with raw,
+  median, and exploratory p95 values.
+- Official improvement verdicts require a complete, comparable, fully valid
+  run with strictly higher micro-F1 and non-lower exact match. The cost-only
+  gate uses the same non-regression condition. Break-even uses
+  `ceil(C_opt / (c_A - c_B))` and is reported as no finite break-even for zero
+  or negative savings, unknown/pending costs, or a failed quality gate.
+  Optimization and baseline-development costs are reported separately; the
+  cost-only calculation uses the optimization run cost.
+- Each benchmark records its sealed-test snapshot hash, exposure index,
+  prior-run reuse history, and an explicit first-blind or exploratory
+  reevaluation label. Repeated runs preserve prior IDs and cannot become fresh
+  confirmatory evidence retroactively.
+
 ## Artifacts and Replay (S9)
 
 - Programs are saved under `artifacts/programs/<program_id>/` as
@@ -382,19 +423,23 @@ labeling, sent-versus-preview trace separation, ten-case baseline outcome and
 budget retention, separate phase confirmations, fixed task-protocol linkage,
 baseline immutability, zero demos, genuine offline GEPA candidate discovery,
 native statistics and proposal/call capture, selected-program round-trip,
-unchanged-baseline and perfect-skip labeling, and stopped/failed compile
-records.
+unchanged-baseline and perfect-skip labeling, stopped/failed compile records,
+synthetic sealed fixtures, deterministic A/B and B/A ordering, equal input and
+task-config fingerprints, all-error retention, invalid/incomplete gates,
+micro-versus-mean metrics, millisecond latency summaries, actual/estimated
+costs, positive/zero/negative cost savings, no-compile saved-program
+reevaluation, Replay compatibility, and test-reuse exposure history.
 
 ## Scope and limitations
 
-S1-S10 complete the 50-case dataset, seal the held-out test split, provide
+S1-S11 complete the 50-case dataset, seal the held-out test split, provide
 deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
 with a strict adapter, add the strict-budget guarded LM/ledger, implement the
 explicitly authorized provider preflight with local records, add safe
 program/run persistence with a read-only Replay reader, and implement the
-separately confirmed baseline validation and genuine GEPA compile paths. They
-do not implement the Streamlit screens, benchmark engine, or Replay
-presentation. Those stages remain in `dspy_plan.md` sections 12-15. No live
+separately confirmed baseline validation, genuine GEPA compile, and paired
+benchmark paths. They do not implement the Streamlit screens or Replay
+presentation. Those stages remain in `dspy_plan.md` sections 13-15. No live
 preflight, optimization, benchmark, or released archive exists, and no paid API
 call has been made. The host
 Python 3.15.0 installation is untouched; only this project's isolated
