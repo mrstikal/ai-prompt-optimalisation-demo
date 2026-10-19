@@ -137,7 +137,9 @@ socket.getaddrinfo = blocked
 
 
 def test_package_import_performs_no_network_io() -> None:
-    result = _run_with_network_blocked("import dspy_lab\nimport dspy_lab.config")
+    result = _run_with_network_blocked(
+        "import dspy_lab\nimport dspy_lab.config\nimport dspy_lab.preflight"
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -191,10 +193,11 @@ def test_gitignore_protects_secrets_and_local_run_artifacts() -> None:
 
 def test_readme_documents_setup_and_stage_status() -> None:
     text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Status: S1-S7 implemented" in text
+    assert "Status: S1-S8 implemented" in text
     assert "deterministic evidence matcher" in text
     assert "one-predictor" in text
     assert "budget guard" in text.lower()
+    assert "provider preflight" in text.lower()
     assert "uv python install 3.14.8" in text
     assert "uv sync --frozen" in text
     assert "3.14.8" in text

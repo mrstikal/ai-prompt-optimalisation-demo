@@ -1,8 +1,8 @@
 """Runtime configuration and frozen API contracts for the DSPy lab.
 
-S1 loads and validates local settings only. Importing this module performs no
+S1-S8 load and validate local settings only. Importing this module performs no
 network I/O and constructs no LM. Live provider capability and pricing checks
-are a later, separately authorized stage.
+stay in the separately authorized preflight module.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ SUPPORTED_PYTHON_MIN = (3, 14)
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 15)
 
 Mode = Literal["live", "replay"]
+ProviderRole = Literal["task", "reflection"]
+ProviderSchemaMode = Literal["native", "json_object"]
 
 EXPECTED_DSPY_VERSION = "3.4.1"
 EXPECTED_GEPA_VERSION = "0.1.4"
@@ -50,6 +52,9 @@ DEFAULT_MAX_BENCHMARK_CALLS = 20
 DEFAULT_MAX_BENCHMARK_COST_USD = Decimal("0.50")
 DEFAULT_MAX_PLAYGROUND_CALLS = 2
 DEFAULT_MAX_PLAYGROUND_COST_USD = Decimal("0.10")
+PREFLIGHT_CALLS = 3
+DEFAULT_MAX_PREFLIGHT_COST_USD = Decimal("0.30")
+PREFLIGHT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "preflight"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 
 GEPA_SEED = 42
@@ -79,6 +84,10 @@ class InvalidConfigurationError(ConfigurationError):
 
 class UnsupportedPythonError(ConfigurationError):
     """Raised when the project runs on an unsupported Python interpreter."""
+
+
+class UnsupportedProviderRouteError(ConfigurationError):
+    """Raised when a selected model/provider pair has no frozen profile."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +126,69 @@ class BudgetLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderRouteProfile:
+    """One frozen OpenRouter route with conservative price ceilings."""
+
+    role: ProviderRole
+    model: str
+    provider: str
+    context_limit: int
+    endpoint_max_output_tokens: int
+    input_usd_per_million: Decimal
+    output_usd_per_million: Decimal
+    cache_write_usd_per_million: Decimal = Decimal("0")
+    expected_schema_mode: ProviderSchemaMode = "native"
+
+    def __post_init__(self) -> None:
+        if self.role not in ("task", "reflection"):
+            raise InvalidConfigurationError(
+                "provider route role must be task or reflection"
+            )
+        object.__setattr__(
+            self, "model", validate_model_id(self.model, field_name="model")
+        )
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise InvalidConfigurationError(
+                "provider route provider must be a non-empty string"
+            )
+        if any(char.isspace() for char in self.provider):
+            raise InvalidConfigurationError(
+                "provider route provider must not contain whitespace"
+            )
+        for name in ("context_limit", "endpoint_max_output_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise InvalidConfigurationError(
+                    f"provider route {name} must be a positive integer"
+                )
+        if self.endpoint_max_output_tokens > self.context_limit:
+            raise InvalidConfigurationError(
+                "provider route endpoint_max_output_tokens must not exceed "
+                "context_limit"
+            )
+        for name in (
+            "input_usd_per_million",
+            "output_usd_per_million",
+            "cache_write_usd_per_million",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or value < 0
+            ):
+                raise InvalidConfigurationError(
+                    f"provider route {name} must be a finite non-negative "
+                    "Decimal"
+                )
+        if self.expected_schema_mode not in ("native", "json_object"):
+            raise InvalidConfigurationError(
+                "provider route expected_schema_mode must be native or "
+                "json_object"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Validated settings shared by the Live workflow and offline tests."""
 
@@ -139,6 +211,7 @@ class Settings:
     max_benchmark_cost_usd: Decimal = DEFAULT_MAX_BENCHMARK_COST_USD
     max_playground_calls: int = DEFAULT_MAX_PLAYGROUND_CALLS
     max_playground_cost_usd: Decimal = DEFAULT_MAX_PLAYGROUND_COST_USD
+    max_preflight_cost_usd: Decimal = DEFAULT_MAX_PREFLIGHT_COST_USD
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
     def optimization_budget(self) -> BudgetLimits:
@@ -169,6 +242,23 @@ class Settings:
             self.max_playground_cost_usd,
         )
 
+    def preflight_budget(self) -> BudgetLimits:
+        return BudgetLimits(
+            "preflight",
+            PREFLIGHT_CALLS,
+            self.max_preflight_cost_usd,
+        )
+
+    def task_route(self) -> ProviderRouteProfile:
+        return resolve_provider_route(
+            self.task_model, self.task_provider, role="task"
+        )
+
+    def reflection_route(self) -> ProviderRouteProfile:
+        return resolve_provider_route(
+            self.reflection_model, self.reflection_provider, role="reflection"
+        )
+
     def redacted(self) -> dict[str, object]:
         """Return a display-safe mapping that never exposes the API key."""
         return {
@@ -191,6 +281,7 @@ class Settings:
             "max_benchmark_cost_usd": self.max_benchmark_cost_usd,
             "max_playground_calls": self.max_playground_calls,
             "max_playground_cost_usd": self.max_playground_cost_usd,
+            "max_preflight_cost_usd": self.max_preflight_cost_usd,
             "request_timeout_seconds": self.request_timeout_seconds,
         }
 
@@ -252,6 +343,69 @@ def validate_model_id(model: str, *, field_name: str = "model") -> str:
 def to_litellm_model_id(model: str) -> str:
     """Add the OpenRouter LiteLLM prefix exactly once."""
     return f"openrouter/{validate_model_id(model)}"
+
+
+PROVIDER_ROUTE_PROFILES: tuple[ProviderRouteProfile, ...] = (
+    ProviderRouteProfile(
+        role="task",
+        model="google/gemini-2.5-flash-lite",
+        provider="google-vertex/eu",
+        context_limit=1_048_576,
+        endpoint_max_output_tokens=65_535,
+        input_usd_per_million=Decimal("0.10"),
+        output_usd_per_million=Decimal("0.40"),
+        cache_write_usd_per_million=Decimal("0.0833333333333333"),
+        expected_schema_mode="native",
+    ),
+    ProviderRouteProfile(
+        role="reflection",
+        model="deepseek/deepseek-chat-v3.1",
+        provider="deepinfra/fp4",
+        context_limit=163_840,
+        endpoint_max_output_tokens=32_768,
+        input_usd_per_million=Decimal("0.25"),
+        output_usd_per_million=Decimal("0.95"),
+        expected_schema_mode="json_object",
+    ),
+    ProviderRouteProfile(
+        role="reflection",
+        model="anthropic/claude-sonnet-4.5",
+        provider="claude-on-aws",
+        context_limit=1_000_000,
+        endpoint_max_output_tokens=64_000,
+        input_usd_per_million=Decimal("6.00"),
+        output_usd_per_million=Decimal("22.50"),
+        cache_write_usd_per_million=Decimal("12.00"),
+        expected_schema_mode="native",
+    ),
+)
+_PROVIDER_ROUTE_INDEX = {
+    (profile.model, profile.provider): profile
+    for profile in PROVIDER_ROUTE_PROFILES
+}
+
+
+def resolve_provider_route(
+    model: str, provider: str, *, role: ProviderRole | None = None
+) -> ProviderRouteProfile:
+    """Return the frozen route profile or fail closed on an unknown route."""
+    try:
+        profile = _PROVIDER_ROUTE_INDEX[(model, provider)]
+    except KeyError:
+        known = ", ".join(
+            f"{item.model}@{item.provider}"
+            for item in PROVIDER_ROUTE_PROFILES
+        )
+        raise UnsupportedProviderRouteError(
+            f"Unsupported OpenRouter route {model!r} on provider "
+            f"{provider!r}; known routes: {known}"
+        ) from None
+    if role is not None and profile.role != role:
+        raise UnsupportedProviderRouteError(
+            f"Route {model!r}@{provider!r} is a {profile.role} route, "
+            f"not a {role} route"
+        )
+    return profile
 
 
 def load_settings(
@@ -353,6 +507,11 @@ def load_settings(
             source,
             "MAX_PLAYGROUND_COST_USD",
             DEFAULT_MAX_PLAYGROUND_COST_USD,
+        ),
+        max_preflight_cost_usd=_read_decimal(
+            source,
+            "MAX_PREFLIGHT_COST_USD",
+            DEFAULT_MAX_PREFLIGHT_COST_USD,
         ),
         request_timeout_seconds=_read_float(
             source,

@@ -27,7 +27,11 @@ from dspy_lab.llm import (
     GuardedLM,
     ModelPricing,
     ModelRoute,
+    build_guarded_lm,
+    model_route_for,
+    openrouter_provider_options,
     sanitize_request_kwargs,
+    validate_provider_options,
 )
 from dspy_lab.schemas import EditorialQAOutput
 
@@ -925,3 +929,167 @@ def test_cache_write_premium_is_reserved() -> None:
     assert pricing.reservation(
         1_000_000, 0, cache_write_tokens=1_000_000
     ) == Decimal("0.30")
+
+
+def test_guarded_lm_pins_provider_routing_by_default() -> None:
+    lm = make_lm(make_ledger())
+    assert lm.routing_options == openrouter_provider_options(PROVIDER)
+    assert lm.supported_params >= {"response_format"}
+    assert lm.kwargs["drop_params"] is False
+    assert lm.kwargs["stream"] is False
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda routing: routing["provider"].update({"allow_fallbacks": True}),
+        lambda routing: routing["provider"].update({"require_parameters": False}),
+        lambda routing: routing["provider"].update({"data_collection": "allow"}),
+        lambda routing: routing["provider"].update({"only": ["other/provider"]}),
+        lambda routing: routing["provider"].update({"order": ["other/provider"]}),
+        lambda routing: routing.update({"reasoning": {"enabled": True}}),
+        lambda routing: routing.update({"cache_control": {"type": "ephemeral"}}),
+        lambda routing: routing.update({"models": ["other/model"]}),
+    ],
+)
+def test_unsafe_provider_routing_is_rejected(mutate) -> None:
+    routing = openrouter_provider_options(PROVIDER)
+    mutate(routing)
+    with pytest.raises(BudgetConfigurationError):
+        make_lm(make_ledger(), extra_body=routing)
+
+
+def test_provider_routing_requires_a_provider_label() -> None:
+    routing = openrouter_provider_options(PROVIDER)
+    with pytest.raises(BudgetConfigurationError):
+        GuardedLM(
+            MODEL,
+            ledger=make_ledger(),
+            pricing=PRICING,
+            context_limit=CONTEXT_LIMIT,
+            max_output_tokens=MAX_OUTPUT,
+            expected_schema_mode="none",
+            provider_label=None,
+            phase="task",
+            api_key=SECRET,
+            extra_body=routing,
+        )
+
+
+def test_call_time_routing_downgrade_is_rejected_before_dispatch(
+    monkeypatch,
+) -> None:
+    calls = install_transport(monkeypatch, [Reply()])
+    lm = make_lm(make_ledger(), expected_schema_mode="none")
+    unsafe = openrouter_provider_options(PROVIDER)
+    unsafe["provider"]["allow_fallbacks"] = True
+    with pytest.raises(BudgetConfigurationError):
+        lm(prompt="hello", extra_body=unsafe)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"drop_params": True},
+        {"stream": True},
+        {"cache": True},
+        {"num_retries": 1},
+    ],
+)
+def test_guarded_lm_rejects_dispatch_downgrades(override) -> None:
+    with pytest.raises(BudgetConfigurationError):
+        make_lm(make_ledger(), **override)
+
+
+def test_guarded_lm_rejects_n_not_equal_to_one(monkeypatch) -> None:
+    calls = install_transport(monkeypatch, [Reply()])
+    lm = make_lm(make_ledger(), expected_schema_mode="none")
+    with pytest.raises(BudgetConfigurationError):
+        lm(prompt="hello", n=2)
+    assert calls == []
+
+
+def test_native_response_format_is_recorded_as_json_safe_schema(
+    monkeypatch,
+) -> None:
+    install_transport(monkeypatch, [Reply('{"findings": []}')])
+    lm = make_lm(make_ledger(), expected_schema_mode="native")
+    lm(prompt="hello", response_format=EditorialQAOutput)
+    recorded = lm.ledger.records[-1].request_kwargs["response_format"]
+    assert recorded["type"] == "json_schema"
+    assert recorded["name"] == "EditorialQAOutput"
+    assert recorded["strict"] is True
+    assert recorded["schema"]["properties"]["findings"]["type"] == "array"
+    assert recorded["schema"]["additionalProperties"] is False
+    assert recorded["wire"]["json_schema"]["strict"] is True
+    assert recorded["wire"]["json_schema"]["name"] == "EditorialQAOutput"
+
+
+def test_reflection_schema_mode_is_deterministic() -> None:
+    json_lm = make_lm(
+        make_ledger(), expected_schema_mode="json_object", phase="reflection"
+    )
+    native_lm = make_lm(
+        make_ledger(), expected_schema_mode="native", phase="reflection"
+    )
+    assert json_lm.supports_response_schema is False
+    assert native_lm.supports_response_schema is True
+
+
+def test_model_route_factory_uses_frozen_profiles() -> None:
+    settings = load_settings(
+        mode="live", env={"OPENROUTER_API_KEY": SECRET}
+    )
+    task = model_route_for(settings, role="task")
+    reflection = model_route_for(settings, role="reflection")
+    assert task.model == MODEL_BARE
+    assert task.provider == PROVIDER
+    assert task.context_limit == 1_048_576
+    assert task.max_output_tokens == settings.max_output_tokens
+    assert task.expected_schema_mode == "native"
+    assert task.pricing.input_usd_per_million == Decimal("0.10")
+    assert reflection.expected_schema_mode == "json_object"
+    assert reflection.max_output_tokens == (
+        settings.reflection_max_output_tokens
+    )
+
+
+def test_build_guarded_lm_pins_route_and_does_not_dispatch() -> None:
+    settings = load_settings(
+        mode="live", env={"OPENROUTER_API_KEY": SECRET}
+    )
+    ledger = make_ledger()
+    task = build_guarded_lm(settings, role="task", ledger=ledger)
+    reflection = build_guarded_lm(
+        settings, role="reflection", ledger=ledger
+    )
+    assert task.model == MODEL
+    assert task.phase == "task"
+    assert task.ledger is ledger
+    assert task.max_output_tokens == settings.max_output_tokens
+    assert task.kwargs["temperature"] == settings.temperature
+    assert task.routing_options == openrouter_provider_options(PROVIDER)
+    assert reflection.phase == "reflection"
+    assert reflection.max_output_tokens == (
+        settings.reflection_max_output_tokens
+    )
+    assert reflection.kwargs["temperature"] == settings.reflection_temperature
+    assert task.supports_response_schema is True
+    assert reflection.supports_response_schema is False
+    assert len(ledger.records) == 0
+
+
+def test_build_guarded_lm_requires_live_mode() -> None:
+    settings = load_settings(mode="replay")
+    with pytest.raises(BudgetConfigurationError):
+        build_guarded_lm(
+            settings, role="task", ledger=make_ledger()
+        )
+
+
+def test_validate_provider_options_accepts_only_the_exact_pin() -> None:
+    routing = openrouter_provider_options(PROVIDER)
+    assert validate_provider_options(routing, provider=PROVIDER) == routing
+    with pytest.raises(BudgetConfigurationError):
+        validate_provider_options([], provider=PROVIDER)

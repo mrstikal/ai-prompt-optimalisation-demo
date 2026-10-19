@@ -20,9 +20,16 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import dspy
+from dspy.clients.legacy_requests import _strict_json_schema
 from pydantic import BaseModel
 
-from .config import BudgetLimits, to_litellm_model_id, validate_model_id
+from .config import (
+    BudgetLimits,
+    ProviderRole,
+    Settings,
+    to_litellm_model_id,
+    validate_model_id,
+)
 
 SchemaMode = Literal["native", "json_object", "none"]
 RequestStatus = Literal[
@@ -187,6 +194,72 @@ def _sanitize_value(value: object) -> object:
     return value
 
 
+_ROUTING_TOP_LEVEL_KEYS = frozenset({"provider", "reasoning"})
+_ROUTING_PROVIDER_KEYS = frozenset(
+    {
+        "only",
+        "order",
+        "allow_fallbacks",
+        "require_parameters",
+        "data_collection",
+    }
+)
+
+
+def openrouter_provider_options(provider: str) -> dict[str, object]:
+    """Return the frozen OpenRouter routing and privacy request body."""
+    provider = _require_text(provider, field_name="provider")
+    return {
+        "provider": {
+            "only": [provider],
+            "order": [provider],
+            "allow_fallbacks": False,
+            "require_parameters": True,
+            "data_collection": "deny",
+        },
+        "reasoning": {"enabled": False},
+    }
+
+
+def validate_provider_options(
+    extra_body: object, *, provider: str
+) -> dict[str, object]:
+    """Fail closed unless routing is the exact pinned, no-fallback shape."""
+    provider = _require_text(provider, field_name="provider")
+    if not isinstance(extra_body, Mapping):
+        raise BudgetConfigurationError(
+            "extra_body must be a mapping with provider routing options"
+        )
+    unknown = set(extra_body) - _ROUTING_TOP_LEVEL_KEYS
+    if unknown:
+        raise BudgetConfigurationError(
+            f"unsupported extra_body keys: {sorted(map(str, unknown))}"
+        )
+    provider_block = extra_body.get("provider")
+    if not isinstance(provider_block, Mapping):
+        raise BudgetConfigurationError(
+            "extra_body.provider must be a mapping"
+        )
+    unknown_provider = set(provider_block) - _ROUTING_PROVIDER_KEYS
+    if unknown_provider:
+        raise BudgetConfigurationError(
+            "unsupported provider routing keys: "
+            f"{sorted(map(str, unknown_provider))}"
+        )
+    expected = openrouter_provider_options(provider)
+    if dict(provider_block) != expected["provider"]:
+        raise BudgetConfigurationError(
+            "provider routing must pin only/order to the selected provider "
+            "with allow_fallbacks=false, require_parameters=true, and "
+            "data_collection=deny"
+        )
+    if extra_body.get("reasoning") != expected["reasoning"]:
+        raise BudgetConfigurationError(
+            "provider reasoning must be explicitly disabled"
+        )
+    return copy.deepcopy(dict(extra_body))
+
+
 def sanitize_request_kwargs(
     kwargs: Mapping[str, object],
 ) -> dict[str, object]:
@@ -195,6 +268,31 @@ def sanitize_request_kwargs(
         str(key): _sanitize_value(value)
         for key, value in kwargs.items()
         if not _is_secret_key(str(key))
+    }
+
+
+def _serialize_response_format(value: object) -> object:
+    """Record the strict wire schema DSPy sends for a native format."""
+    if isinstance(value, type) and issubclass(value, BaseModel):
+        schema_model = value
+    elif isinstance(value, BaseModel):
+        schema_model = type(value)
+    else:
+        return value
+    strict_schema = _strict_json_schema(schema_model.model_json_schema())
+    return {
+        "type": "json_schema",
+        "name": schema_model.__name__,
+        "strict": True,
+        "schema": strict_schema,
+        "wire": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_model.__name__,
+                "schema": strict_schema,
+                "strict": True,
+            },
+        },
     }
 
 
@@ -949,6 +1047,20 @@ class GuardedLM(dspy.LM):
             provider_label = _require_text(
                 provider_label, field_name="provider_label"
             )
+        raw_extra_body = kwargs.pop("extra_body", None)
+        if provider_label is None:
+            if raw_extra_body is not None:
+                raise BudgetConfigurationError(
+                    "provider routing requires provider_label"
+                )
+        else:
+            if raw_extra_body is None:
+                raw_extra_body = openrouter_provider_options(provider_label)
+            else:
+                raw_extra_body = validate_provider_options(
+                    raw_extra_body, provider=provider_label
+                )
+            kwargs["extra_body"] = raw_extra_body
         formatting_overhead_tokens = _require_int(
             formatting_overhead_tokens,
             field_name="formatting_overhead_tokens",
@@ -984,6 +1096,16 @@ class GuardedLM(dspy.LM):
             raise BudgetConfigurationError(
                 "provider prompt caching is not allowed"
             )
+        if "drop_params" in kwargs and kwargs["drop_params"] is not False:
+            raise BudgetConfigurationError(
+                "GuardedLM requires drop_params=False"
+            )
+        if kwargs.get("stream") is True:
+            raise BudgetConfigurationError(
+                "GuardedLM requires non-streaming inference"
+            )
+        kwargs["drop_params"] = False
+        kwargs.setdefault("stream", False)
         if "max_completion_tokens" in kwargs:
             raise BudgetConfigurationError(
                 "GuardedLM supports max_tokens only; "
@@ -1022,6 +1144,7 @@ class GuardedLM(dspy.LM):
         self._phase = phase
         self._token_counter = token_counter
         self._formatting_overhead_tokens = formatting_overhead_tokens
+        self._routing_options = copy.deepcopy(kwargs.get("extra_body"))
         self._call_lock = threading.Lock()
         self._secret_values = tuple(
             str(value)
@@ -1081,6 +1204,19 @@ class GuardedLM(dspy.LM):
     @property
     def phase(self) -> str:
         return self._phase
+
+    @property
+    def routing_options(self) -> dict[str, object] | None:
+        return copy.deepcopy(self._routing_options)
+
+    @property
+    def supports_response_schema(self) -> bool:
+        """Keep the frozen schema mode deterministic across LiteLLM metadata."""
+        if self._expected_schema_mode == "json_object":
+            return False
+        if self._expected_schema_mode == "native":
+            return True
+        return super().supports_response_schema
 
     def __call__(self, prompt=None, *, messages=None, **kwargs):
         delegated = self._validated_kwargs(kwargs)
@@ -1187,6 +1323,28 @@ class GuardedLM(dspy.LM):
             raise BudgetConfigurationError(
                 "provider cache-control parameters are not allowed"
             )
+        if merged.get("drop_params") is not False:
+            raise BudgetConfigurationError(
+                "budgeted calls require drop_params=False"
+            )
+        if merged.get("stream") is True:
+            raise BudgetConfigurationError(
+                "budgeted calls require non-streaming inference"
+            )
+        if self._provider_label is None:
+            if merged.get("extra_body") is not None:
+                raise BudgetConfigurationError(
+                    "provider routing requires provider_label"
+                )
+        else:
+            routing = merged.get("extra_body")
+            if routing is None:
+                raise BudgetConfigurationError(
+                    "provider routing options are required before dispatch"
+                )
+            merged["extra_body"] = validate_provider_options(
+                routing, provider=self._provider_label
+            )
         self._check_schema_mode(merged.get("response_format"))
         requested_max = merged.get("max_tokens")
         if requested_max is not None:
@@ -1206,6 +1364,8 @@ class GuardedLM(dspy.LM):
             if requested_max is not None
             else self._max_output_tokens
         )
+        if "extra_body" in kwargs:
+            delegated["extra_body"] = merged["extra_body"]
         return delegated
 
     def _check_schema_mode(self, response_format: object) -> None:
@@ -1266,9 +1426,13 @@ class GuardedLM(dspy.LM):
     def _recorded_request_kwargs(
         self, delegated: Mapping[str, object]
     ) -> dict[str, object]:
-        return sanitize_request_kwargs(
+        recorded = sanitize_request_kwargs(
             {**self.kwargs, **delegated}
         )
+        recorded["response_format"] = _serialize_response_format(
+            recorded.get("response_format")
+        )
+        return recorded
 
     def _sanitize_text(self, text: str) -> str:
         for secret in self._secret_values:
@@ -1315,6 +1479,70 @@ class GuardedLM(dspy.LM):
         )
 
 
+def model_route_for(settings: Settings, *, role: ProviderRole) -> ModelRoute:
+    """Build the frozen route for one experiment role from validated settings."""
+    if not isinstance(settings, Settings):
+        raise BudgetConfigurationError("settings must be a Settings instance")
+    if role == "task":
+        profile = settings.task_route()
+        output_cap = settings.max_output_tokens
+    elif role == "reflection":
+        profile = settings.reflection_route()
+        output_cap = settings.reflection_max_output_tokens
+    else:
+        raise BudgetConfigurationError(
+            "role must be task or reflection"
+        )
+    if output_cap > profile.endpoint_max_output_tokens:
+        raise BudgetConfigurationError(
+            f"{role} output cap {output_cap} exceeds the frozen endpoint "
+            f"limit {profile.endpoint_max_output_tokens}"
+        )
+    return ModelRoute(
+        model=profile.model,
+        provider=profile.provider,
+        context_limit=profile.context_limit,
+        max_output_tokens=output_cap,
+        pricing=ModelPricing(
+            profile.input_usd_per_million,
+            profile.output_usd_per_million,
+            cache_write_usd_per_million=profile.cache_write_usd_per_million,
+        ),
+        expected_schema_mode=profile.expected_schema_mode,
+    )
+
+
+def build_guarded_lm(
+    settings: Settings,
+    *,
+    role: ProviderRole,
+    ledger: BudgetLedger,
+) -> GuardedLM:
+    """Build a real guarded LM for the selected task or reflection role."""
+    if settings.mode != "live":
+        raise BudgetConfigurationError(
+            "a provider LM can only be built in Live mode"
+        )
+    if not settings.openrouter_api_key:
+        raise BudgetConfigurationError(
+            "a Live provider LM requires OPENROUTER_API_KEY"
+        )
+    route = model_route_for(settings, role=role)
+    temperature = (
+        settings.temperature
+        if role == "task"
+        else settings.reflection_temperature
+    )
+    return GuardedLM.from_route(
+        route,
+        ledger=ledger,
+        phase=role,
+        api_key=settings.openrouter_api_key,
+        temperature=temperature,
+        timeout=settings.request_timeout_seconds,
+    )
+
+
 __all__ = [
     "BudgetCancelled",
     "BudgetConfigurationError",
@@ -1331,5 +1559,9 @@ __all__ = [
     "Reservation",
     "SchemaMode",
     "StopReason",
+    "build_guarded_lm",
+    "model_route_for",
+    "openrouter_provider_options",
     "sanitize_request_kwargs",
+    "validate_provider_options",
 ]

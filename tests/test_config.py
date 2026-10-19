@@ -12,6 +12,7 @@ from dspy_lab.config import (
     DEFAULT_MAX_OPTIMIZATION_CALLS,
     DEFAULT_MAX_OPTIMIZATION_COST_USD,
     DEFAULT_MAX_OPTIMIZATION_METRIC_CALLS,
+    DEFAULT_MAX_PREFLIGHT_COST_USD,
     DEFAULT_REFLECTION_MODEL,
     DEFAULT_REFLECTION_PROVIDER,
     DEFAULT_TASK_MODEL,
@@ -19,6 +20,7 @@ from dspy_lab.config import (
     DEFAULT_TEMPERATURE,
     InvalidConfigurationError,
     MissingConfigurationError,
+    UnsupportedProviderRouteError,
     UnsupportedPythonError,
     load_settings,
     to_litellm_model_id,
@@ -106,6 +108,7 @@ def test_live_environment_overrides_are_parsed_exactly() -> None:
             "MAX_BENCHMARK_COST_USD": "0.30",
             "MAX_PLAYGROUND_CALLS": "2",
             "MAX_PLAYGROUND_COST_USD": "0.05",
+            "MAX_PREFLIGHT_COST_USD": "0.40",
             "REQUEST_TIMEOUT_SECONDS": "60",
         },
     )
@@ -126,6 +129,7 @@ def test_live_environment_overrides_are_parsed_exactly() -> None:
     assert settings.max_benchmark_cost_usd == Decimal("0.30")
     assert settings.max_playground_calls == 2
     assert settings.max_playground_cost_usd == Decimal("0.05")
+    assert settings.max_preflight_cost_usd == Decimal("0.40")
     assert settings.request_timeout_seconds == 60.0
 
 
@@ -160,6 +164,7 @@ def test_live_environment_overrides_are_parsed_exactly() -> None:
         ("MAX_BASELINE_DEV_CALLS", "0"),
         ("MAX_BENCHMARK_CALLS", "0"),
         ("MAX_PLAYGROUND_CALLS", "0"),
+        ("MAX_PREFLIGHT_COST_USD", "-0.01"),
         ("REQUEST_TIMEOUT_SECONDS", "0"),
     ],
 )
@@ -242,3 +247,68 @@ def test_configuration_loading_does_not_open_a_socket(
     monkeypatch.setattr(socket, "getaddrinfo", blocked)
     settings = load_settings(mode="live", env=BASE_LIVE_ENV)
     assert settings.mode == "live"
+
+
+def test_default_provider_routes_are_frozen() -> None:
+    settings = load_settings(mode="live", env=BASE_LIVE_ENV)
+    task = settings.task_route()
+    reflection = settings.reflection_route()
+    assert task.model == DEFAULT_TASK_MODEL
+    assert task.provider == DEFAULT_TASK_PROVIDER
+    assert task.expected_schema_mode == "native"
+    assert task.context_limit == 1_048_576
+    assert task.input_usd_per_million == Decimal("0.10")
+    assert task.output_usd_per_million == Decimal("0.40")
+    assert reflection.model == DEFAULT_REFLECTION_MODEL
+    assert reflection.provider == DEFAULT_REFLECTION_PROVIDER
+    assert reflection.expected_schema_mode == "json_object"
+    assert reflection.context_limit == 163_840
+    assert reflection.input_usd_per_million == Decimal("0.25")
+    assert reflection.output_usd_per_million == Decimal("0.95")
+
+
+def test_quality_reflection_route_is_predeclared() -> None:
+    settings = load_settings(
+        mode="live",
+        env={
+            **BASE_LIVE_ENV,
+            "REFLECTION_MODEL": "anthropic/claude-sonnet-4.5",
+            "REFLECTION_PROVIDER": "claude-on-aws",
+        },
+    )
+    reflection = settings.reflection_route()
+    assert reflection.expected_schema_mode == "native"
+    assert reflection.context_limit == 1_000_000
+    assert reflection.input_usd_per_million == Decimal("6.00")
+    assert reflection.output_usd_per_million == Decimal("22.50")
+
+
+def test_unknown_route_fails_closed() -> None:
+    settings = load_settings(
+        mode="live",
+        env={
+            **BASE_LIVE_ENV,
+            "TASK_MODEL": "openai/gpt-4.1-mini",
+            "TASK_PROVIDER": "openai",
+        },
+    )
+    with pytest.raises(UnsupportedProviderRouteError):
+        settings.task_route()
+
+
+def test_route_role_mismatch_fails_closed() -> None:
+    settings = load_settings(mode="live", env=BASE_LIVE_ENV)
+    with pytest.raises(UnsupportedProviderRouteError):
+        config.resolve_provider_route(
+            settings.reflection_model,
+            settings.reflection_provider,
+            role="task",
+        )
+
+
+def test_preflight_budget_is_fixed_to_three_calls() -> None:
+    settings = load_settings(mode="live", env=BASE_LIVE_ENV)
+    budget = settings.preflight_budget()
+    assert budget.phase == "preflight"
+    assert budget.max_calls == 3
+    assert budget.max_cost_usd == DEFAULT_MAX_PREFLIGHT_COST_USD

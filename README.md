@@ -4,7 +4,7 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S7 implemented.** S1 establishes the isolated Python
+**Status: S1-S8 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
@@ -19,8 +19,11 @@ baseline fingerprint/manifest, and offline scripted-transport tests. S7 adds the
 strict-budget guarded LM, one shared atomic request ledger, conservative Decimal
 reservations, reconciliation for unknown costs, cancellation/budget-stop
 semantics, request telemetry, and secret redaction, all tested against a mocked
-LiteLLM transport. The UI, provider preflight, optimization, benchmark, and
-Replay archive are not implemented. No paid API call has been made.
+LiteLLM transport. S8 adds frozen OpenRouter route profiles, strict
+single-provider routing, public endpoint-catalog snapshots, an explicitly
+confirmed three-call compatibility preflight, and local JSON preflight records.
+The UI, optimization, benchmark, and Replay archive are not implemented. No
+paid API call has been made.
 
 ## Requirements
 
@@ -69,8 +72,8 @@ uv run --env-file .env python -c \
 `OPENROUTER_API_KEY`. `load_settings("live")` validates the key, bare
 OpenRouter model IDs, provider pins, numeric limits, and the relationship
 between the GEPA metric-call target and the total optimization call cap. It
-performs no network request; provider capability, strict-schema, and pricing
-preflight belongs to S8 and requires separate authorization.
+performs no network request. Provider capability, strict-schema, and pricing
+checks happen only in the separately authorized S8 preflight.
 
 Frozen initial defaults are defined in `src/dspy_lab/config.py`:
 
@@ -87,6 +90,7 @@ Frozen initial defaults are defined in `src/dspy_lab/config.py`:
 | Baseline development call / USD cap | 10 / 0.50 USD |
 | Benchmark call / USD cap | 20 / 0.50 USD |
 | Playground call / USD cap | 2 / 0.10 USD |
+| Preflight calls / USD cap | 3 / 0.30 USD |
 | Cache / threads / automatic retries | off / 1 / 0 |
 | GEPA seed / reflection minibatch | 42 / 3 |
 
@@ -179,6 +183,47 @@ uv run python -c \
   `benchmark_budget()`, and `playground_budget()` expose the named
   `BudgetLimits` phases.
 
+## Provider preflight (S8)
+
+- `src/dspy_lab/config.py` freezes three known OpenRouter routes: the task
+  route `google/gemini-2.5-flash-lite` on `google-vertex/eu` (native strict
+  schema), the budget reflection route `deepseek/deepseek-chat-v3.1` on
+  `deepinfra/fp4` (explicit JSON-object mode), and the quality reflection route
+  `anthropic/claude-sonnet-4.5` on `claude-on-aws` (native schema, 6.00/22.50
+  USD per million long-context ceiling). It also freezes context/output
+  bounds, cache-write ceilings, and a 3-call/0.30 USD preflight budget.
+- `src/dspy_lab/llm.py` pins every real LM to one provider with
+  `only`/`order`, `allow_fallbacks=false`, `require_parameters=true`,
+  `data_collection=deny`, and reasoning disabled. Provider routing, schema
+  mode, `drop_params`, streaming, cache controls, and retries are rejected
+  before dispatch if they deviate from the contract.
+- `src/dspy_lab/preflight.py` is the only S8 network entry point. It fetches
+  the public endpoint catalog for both routes, rejects missing tags, prices
+  above the frozen ceilings, service tiers, and schema drift, then makes
+  exactly two task calls (one clean and one multi-issue training case) and one
+  256-token reflection call. There are no retries or model swaps.
+- Each attempt writes `runs/preflight/<run_id>.json` atomically with mode 0600.
+  The record captures the public endpoint snapshot, request messages, routing,
+  request parameters (including the strict wire `response_format`), generation
+  IDs, usage, estimated cost, finish reasons, schema modes, checks, warnings,
+  and the shared ledger. The API key is
+  redacted and never written.
+- The default 0.30 USD cap covers the conservative reservation of the budget
+  routes. The quality reflection route reserves about 6.31 USD for the same
+  three calls, so it requires a deliberately raised
+  `MAX_PREFLIGHT_COST_USD` and re-confirmation.
+
+```bash
+# Explicit authorization; this spends real money (up to the confirmed cap).
+uv run --env-file .env python -m dspy_lab.preflight \
+  --confirm-preflight-budget
+```
+
+The preflight fails before any model dispatch when the conservative
+reservation does not fit the cap. Catalog metadata requests are public and
+cost no tokens, but they do require network access. Do not run the command
+until the separate preflight budget has been approved.
+
 ## Frozen API contracts
 
 These are the version-specific contracts S1 is pinned against. Later stages
@@ -220,8 +265,15 @@ uv run pytest
 ```
 
 The default suite is offline: it requires no API key, makes no paid call, and
-excludes tests marked `live`. A later provider preflight is selected explicitly
-with `uv run pytest -m live` only after a separate budget confirmation. Tests
+excludes tests marked `live`. The S8 live test is selected explicitly only
+after a separate budget confirmation:
+
+```bash
+RUN_LIVE_PREFLIGHT=1 uv run --env-file .env pytest -m live \
+  tests/test_preflight.py
+```
+
+Tests
 verify the actual Python version, the committed lockfile, genuine GEPA/LiteLLM
 availability, Python 3.15 rejection, configuration validation, secret
 redaction, no network access during package import, strict schema behavior,
@@ -235,15 +287,20 @@ agreement, one-predictor DSPy baseline behavior, strict JSON/native-schema
 requests, zero-demo fingerprint stability, no gold leakage, exact budget
 reservation/call caps, shared-ledger copies, concurrent admission, unknown-cost
 retention, cancellation, real adapter fallback accounting, price-unit
-conversion, secret redaction, and rejection of the sealed test path by the
-optimization loader.
+conversion, secret redaction, rejection of the sealed test path by the
+optimization loader, frozen route profiles, single-provider routing, schema
+mode determinism, catalog drift rejection, the exact two-task/one-reflection
+preflight plan, failure records without retries, and preflight budget
+enforcement.
 
 ## Scope and limitations
 
-S1-S7 complete the 50-case dataset, seal the held-out test split, provide
+S1-S8 complete the 50-case dataset, seal the held-out test split, provide
 deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
-with a strict adapter, and add the strict-budget guarded LM/ledger. They do not
-implement the Streamlit screens, provider preflight, optimization, benchmark, or
-Replay archive. Those stages remain in `dspy_plan.md` sections 12-15. The host
+with a strict adapter, add the strict-budget guarded LM/ledger, and implement
+the explicitly authorized provider preflight with local records. They do not
+implement the Streamlit screens, optimization, benchmark, or Replay archive.
+Those stages remain in `dspy_plan.md` sections 12-15. No live preflight has
+been run in this repository and no paid API call has been made. The host
 Python 3.15.0 installation is untouched; only this project's isolated
 environment uses 3.14.8.
