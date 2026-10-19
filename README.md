@@ -82,18 +82,19 @@ Frozen initial defaults are defined in `src/dspy_lab/config.py`:
 
 | Setting | Default |
 |---|---|
-| Task model | `google/gemini-2.5-flash-lite` |
-| Task provider pin | `google-vertex/eu` |
-| Reflection model | `deepseek/deepseek-chat-v3.1` |
-| Reflection provider pin | `deepinfra/fp4` |
+| Task model | `deepseek/deepseek-v4.1-flash-1017` |
+| Task provider pin | `deepinfra/fp8` |
+| Reflection model | `openai/gpt-6-sol` |
+| Reflection provider pin | `openai` |
+| Cheaper reflection alternative | `deepseek/deepseek-v4.1-flash-1017` on `deepinfra/fp8` |
 | Task temperature / output cap | 0.0 / 2048 tokens |
 | Reflection temperature / output cap | 1.0 / 4096 tokens |
 | GEPA metric-call target | 120 |
-| Optimization call / USD cap | 160 / 2.00 USD |
+| Optimization call / USD cap | 160 / 5.00 USD |
 | Baseline development call / USD cap | 10 / 0.50 USD |
 | Benchmark call / USD cap | 20 / 0.50 USD |
-| Playground call / USD cap | 2 / 0.10 USD |
-| Preflight calls / USD cap | 3 / 0.30 USD |
+| Playground call / USD cap | 2 / 0.15 USD |
+| Preflight calls / USD cap | 3 / 4.50 USD |
 | Cache / threads / automatic retries | off / 1 / 0 |
 | GEPA seed / reflection minibatch | 42 / 3 |
 
@@ -189,12 +190,15 @@ uv run python -c \
 ## Provider preflight (S8)
 
 - `src/dspy_lab/config.py` freezes three known OpenRouter routes: the task
-  route `google/gemini-2.5-flash-lite` on `google-vertex/eu` (native strict
-  schema), the budget reflection route `deepseek/deepseek-chat-v3.1` on
-  `deepinfra/fp4` (explicit JSON-object mode), and the quality reflection route
-  `anthropic/claude-sonnet-4.5` on `claude-on-aws` (native schema, 6.00/22.50
-  USD per million long-context ceiling). It also freezes context/output
-  bounds, cache-write ceilings, and a 3-call/0.30 USD preflight budget.
+  route `deepseek/deepseek-v4.1-flash-1017` on `deepinfra/fp8` (native strict
+  schema, 0.098/0.294 USD per million), the strong default reflection route
+  `openai/gpt-6-sol` on `openai` (native schema, 4.00/15.00 USD per million
+  long-context ceiling), and the cheaper alternative reflection route
+  `deepseek/deepseek-v4.1-flash-1017` on `deepinfra/fp8` (explicit JSON-object
+  mode). It also freezes context/output bounds, cache-write ceilings, and a
+  3-call/4.50 USD preflight budget. The cheaper reflection route can be
+  selected with `REFLECTION_MODEL`/`REFLECTION_PROVIDER` and needs about
+  0.35 USD for the same three-call preflight.
 - `src/dspy_lab/llm.py` pins every real LM to one provider with
   `only`/`order`, `allow_fallbacks=false`, `require_parameters=true`,
   `data_collection=deny`, and reasoning disabled. Provider routing, schema
@@ -211,10 +215,13 @@ uv run python -c \
   IDs, usage, estimated cost, finish reasons, schema modes, checks, warnings,
   and the shared ledger. The API key is
   redacted and never written.
-- The default 0.30 USD cap covers the conservative reservation of the budget
-  routes. The quality reflection route reserves about 6.31 USD for the same
-  three calls, so it requires a deliberately raised
-  `MAX_PREFLIGHT_COST_USD` and re-confirmation.
+- The default 4.50 USD cap covers the conservative full-context reservation
+  of two DeepSeek task calls plus one GPT-6 Sol reflection call (about 4.47
+  USD). The cheaper DeepSeek reflection alternative reserves about 0.31 USD;
+  lower `MAX_PREFLIGHT_COST_USD` deliberately when selecting it. The raised
+  optimization cap (5.00 USD) is required because one full-context GPT-6 Sol
+  reflection reservation is about 4.26 USD; actual token spend is normally
+  much lower.
 
 ```bash
 # Explicit authorization; this spends real money (up to the confirmed cap).

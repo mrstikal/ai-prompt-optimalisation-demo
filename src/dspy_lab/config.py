@@ -35,25 +35,25 @@ EXPECTED_LITELLM_VERSION = "1.106.0"
 EXPECTED_PYDANTIC_VERSION = "2.14.1"
 EXPECTED_STREAMLIT_VERSION = "1.66.0"
 
-DEFAULT_TASK_MODEL = "google/gemini-2.5-flash-lite"
-DEFAULT_REFLECTION_MODEL = "deepseek/deepseek-chat-v3.1"
-DEFAULT_TASK_PROVIDER = "google-vertex/eu"
-DEFAULT_REFLECTION_PROVIDER = "deepinfra/fp4"
+DEFAULT_TASK_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+DEFAULT_REFLECTION_MODEL = "openai/gpt-6-sol"
+DEFAULT_TASK_PROVIDER = "deepinfra/fp8"
+DEFAULT_REFLECTION_PROVIDER = "openai"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_OUTPUT_TOKENS = 2_048
 DEFAULT_REFLECTION_TEMPERATURE = 1.0
 DEFAULT_REFLECTION_MAX_OUTPUT_TOKENS = 4_096
 DEFAULT_MAX_OPTIMIZATION_CALLS = 160
-DEFAULT_MAX_OPTIMIZATION_COST_USD = Decimal("2.00")
+DEFAULT_MAX_OPTIMIZATION_COST_USD = Decimal("5.00")
 DEFAULT_MAX_OPTIMIZATION_METRIC_CALLS = 120
 DEFAULT_MAX_BASELINE_DEV_CALLS = 10
 DEFAULT_MAX_BASELINE_DEV_COST_USD = Decimal("0.50")
 DEFAULT_MAX_BENCHMARK_CALLS = 20
 DEFAULT_MAX_BENCHMARK_COST_USD = Decimal("0.50")
 DEFAULT_MAX_PLAYGROUND_CALLS = 2
-DEFAULT_MAX_PLAYGROUND_COST_USD = Decimal("0.10")
+DEFAULT_MAX_PLAYGROUND_COST_USD = Decimal("0.15")
 PREFLIGHT_CALLS = 3
-DEFAULT_MAX_PREFLIGHT_COST_USD = Decimal("0.30")
+DEFAULT_MAX_PREFLIGHT_COST_USD = Decimal("4.50")
 PREFLIGHT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "preflight"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 
@@ -348,39 +348,40 @@ def to_litellm_model_id(model: str) -> str:
 PROVIDER_ROUTE_PROFILES: tuple[ProviderRouteProfile, ...] = (
     ProviderRouteProfile(
         role="task",
-        model="google/gemini-2.5-flash-lite",
-        provider="google-vertex/eu",
+        model="deepseek/deepseek-v4.1-flash-1017",
+        provider="deepinfra/fp8",
         context_limit=1_048_576,
-        endpoint_max_output_tokens=65_535,
-        input_usd_per_million=Decimal("0.10"),
-        output_usd_per_million=Decimal("0.40"),
-        cache_write_usd_per_million=Decimal("0.0833333333333333"),
+        endpoint_max_output_tokens=131_072,
+        input_usd_per_million=Decimal("0.098"),
+        output_usd_per_million=Decimal("0.294"),
+        cache_write_usd_per_million=Decimal("0"),
         expected_schema_mode="native",
     ),
     ProviderRouteProfile(
         role="reflection",
-        model="deepseek/deepseek-chat-v3.1",
-        provider="deepinfra/fp4",
-        context_limit=163_840,
-        endpoint_max_output_tokens=32_768,
-        input_usd_per_million=Decimal("0.25"),
-        output_usd_per_million=Decimal("0.95"),
+        model="openai/gpt-6-sol",
+        provider="openai",
+        context_limit=1_050_000,
+        endpoint_max_output_tokens=128_000,
+        input_usd_per_million=Decimal("4.00"),
+        output_usd_per_million=Decimal("15.00"),
+        cache_write_usd_per_million=Decimal("5.00"),
+        expected_schema_mode="native",
+    ),
+    ProviderRouteProfile(
+        role="reflection",
+        model="deepseek/deepseek-v4.1-flash-1017",
+        provider="deepinfra/fp8",
+        context_limit=1_048_576,
+        endpoint_max_output_tokens=131_072,
+        input_usd_per_million=Decimal("0.098"),
+        output_usd_per_million=Decimal("0.294"),
+        cache_write_usd_per_million=Decimal("0"),
         expected_schema_mode="json_object",
-    ),
-    ProviderRouteProfile(
-        role="reflection",
-        model="anthropic/claude-sonnet-4.5",
-        provider="claude-on-aws",
-        context_limit=1_000_000,
-        endpoint_max_output_tokens=64_000,
-        input_usd_per_million=Decimal("6.00"),
-        output_usd_per_million=Decimal("22.50"),
-        cache_write_usd_per_million=Decimal("12.00"),
-        expected_schema_mode="native",
     ),
 )
 _PROVIDER_ROUTE_INDEX = {
-    (profile.model, profile.provider): profile
+    (profile.role, profile.model, profile.provider): profile
     for profile in PROVIDER_ROUTE_PROFILES
 }
 
@@ -389,23 +390,32 @@ def resolve_provider_route(
     model: str, provider: str, *, role: ProviderRole | None = None
 ) -> ProviderRouteProfile:
     """Return the frozen route profile or fail closed on an unknown route."""
-    try:
-        profile = _PROVIDER_ROUTE_INDEX[(model, provider)]
-    except KeyError:
-        known = ", ".join(
-            f"{item.model}@{item.provider}"
-            for item in PROVIDER_ROUTE_PROFILES
-        )
-        raise UnsupportedProviderRouteError(
-            f"Unsupported OpenRouter route {model!r} on provider "
-            f"{provider!r}; known routes: {known}"
-        ) from None
-    if role is not None and profile.role != role:
-        raise UnsupportedProviderRouteError(
-            f"Route {model!r}@{provider!r} is a {profile.role} route, "
-            f"not a {role} route"
-        )
-    return profile
+    if role is not None:
+        try:
+            return _PROVIDER_ROUTE_INDEX[(role, model, provider)]
+        except KeyError:
+            pass
+    else:
+        matches = [
+            profile
+            for profile in PROVIDER_ROUTE_PROFILES
+            if profile.model == model and profile.provider == provider
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise UnsupportedProviderRouteError(
+                f"Route {model!r} on provider {provider!r} is ambiguous; "
+                "specify the task or reflection role"
+            )
+    known = ", ".join(
+        f"{item.role}:{item.model}@{item.provider}"
+        for item in PROVIDER_ROUTE_PROFILES
+    )
+    raise UnsupportedProviderRouteError(
+        f"Unsupported OpenRouter route {model!r} on provider "
+        f"{provider!r} for role {role!r}; known routes: {known}"
+    )
 
 
 def load_settings(

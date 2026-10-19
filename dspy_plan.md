@@ -467,7 +467,7 @@ Those credentials, provider checks, and budget confirmations are Live-only. Reso
 
 The first manual baseline-development run evaluates the ten validation articles under its own phase and confirmation, with initial `MAX_BASELINE_DEV_CALLS=10` and `MAX_BASELINE_DEV_COST_USD=0.50`. A training-set baseline evaluation is optional and requires a new explicit development-run budget. Do not hide either behind the optimizer's cap; GEPA's own seed validation calls still count separately inside compilation.
 
-Store bare OpenRouter model IDs in `TASK_MODEL`/`REFLECTION_MODEL`. The LM factory adds the LiteLLM prefix once, for example `openrouter/google/gemini-2.5-flash-lite`. The documented OpenRouter API base is `https://openrouter.ai/api/v1`, with chat completions at `/chat/completions`. Credentials come from the server environment. Confirm the locked DSPy backend and provider-option passthrough at the transport boundary; a constructor accepting a dictionary does not prove OpenRouter received it.
+Store bare OpenRouter model IDs in `TASK_MODEL`/`REFLECTION_MODEL`. The LM factory adds the LiteLLM prefix once, for example `openrouter/deepseek/deepseek-v4.1-flash-1017`. The documented OpenRouter API base is `https://openrouter.ai/api/v1`, with chat completions at `/chat/completions`. Credentials come from the server environment. Confirm the locked DSPy backend and provider-option passthrough at the transport boundary; a constructor accepting a dictionary does not prove OpenRouter received it.
 
 No key is committed, serialized, rendered in a form, logged, or included in browser-side code. The UI reports only whether server-side credentials are configured. Future `.env.example` contains names and safe placeholders only; `.env`, local secrets, and private run artifacts are ignored by Git. Read-only artifact inspection must work without a key.
 
@@ -475,17 +475,17 @@ Keep `TASK_MODEL` fixed across both arms of an experiment. A stronger reflection
 
 ### 8.2 Verified Model and Route Candidates
 
-The following are public read-only endpoint-catalog observations from 2026-10-18, independently checked using `/api/v1/models/{author}/{slug}/endpoints`. These endpoints exist; a 404 from the shorter model-detail URL does not mean no model-specific endpoint API exists. All selected entries advertised both `structured_outputs` and `response_format`. Availability to this account, strict-schema behavior, Czech task quality, and exact DSPy passthrough have not been exercised.
+The following are public read-only endpoint-catalog observations from 2026-10-19, independently checked using `/api/v1/models/{author}/{slug}/endpoints`. These endpoints exist; a 404 from the shorter model-detail URL does not mean no model-specific endpoint API exists. All selected entries advertised both `structured_outputs` and `response_format`. Availability to this account, strict-schema behavior, Czech task quality, and exact DSPy passthrough have not been exercised.
 
 | Role | Exact OpenRouter ID | Observed route tag | USD / 1M input | USD / 1M output | Context / max output tokens |
 |---|---|---|---:|---:|---|
-| Common task model | `google/gemini-2.5-flash-lite` | `google-vertex/eu` | 0.10 | 0.40 | 1,048,576 / 65,535 |
-| Budget reflection | `deepseek/deepseek-chat-v3.1` | `deepinfra/fp4` | 0.25 | 0.95 | 163,840 / 32,768 |
-| Quality reflection | `anthropic/claude-sonnet-4.5` | `claude-on-aws` | 3.00 | 15.00 | 1,000,000 / 64,000 |
+| Common task model | `deepseek/deepseek-v4.1-flash-1017` | `deepinfra/fp8` | 0.098 | 0.294 | 1,048,576 / 131,072 |
+| Budget reflection | `deepseek/deepseek-v4.1-flash-1017` | `deepinfra/fp8` | 0.098 | 0.294 | 1,048,576 / 131,072 |
+| Strong reflection | `openai/gpt-6-sol` | `openai` | 4.00 | 15.00 | 1,050,000 / 128,000 |
 
-These are selected-route rates, not a claim that the catalog's cheapest headline route is the one used. For example, Gemini also advertised a discounted Flex endpoint at 0.05/0.20 and a Priority endpoint at 0.18/0.72; neither belongs in a latency-fair comparison with the standard selected route. Other DeepSeek providers have different quantization, output limits, and prices.
+These are selected-route rates, not a claim that the catalog's cheapest headline route is the one used. DeepSeek V4.1 Flash has many providers with different quantization, output limits, and prices; the selected `deepinfra/fp8` standard route advertises 0.098/0.294 and implicit caching without a cache-write charge. Flex and Priority DeepInfra variants are excluded from the reproducible route.
 
-Sonnet's selected endpoint explicitly advertises an override above 200,000 prompt tokens: 6.00 input / 22.50 output USD per million. It also advertises cache-write rates of 3.75 for ordinary writes and 6.00 for one-hour writes, rising to 7.50 and 12.00 in the long-context tier. This disproves the assumption that ignoring all cache effects always gives a cost upper bound. Gemini's selected route advertises reasoning at the output rate and cache writes at approximately 0.083333 per million input tokens. Record all applicable pricing overrides/cache-write charges in reservations, not just base input/output prices.
+GPT-6 Sol's selected OpenAI endpoint advertises a long-context override above 272,000 prompt tokens: 4.00 input / 15.00 output USD per million, with cache-write rates rising to 5.00 per million. Both the base and override prices are checked by preflight; the table records the maximum applicable tier. Record all applicable pricing overrides/cache-write charges in reservations, not just base input/output prices.
 
 Use text-only requests, no web search, server tools, audio/images, or explicit provider prompt-cache writes. Snapshot the complete selected endpoint metadata/pricing and active routing filters at run start; fail closed if the chosen route disappears, changes price above the configured ceiling, or no longer supports the requested schema/parameters. Do not use `:free`, `:batch`, `:nitro`, `:floor`, or floating `latest` aliases for the primary reproducible benchmark.
 
@@ -495,24 +495,24 @@ These are proposed initial limits, not measured spend or proven quality. Both ke
 
 | Setting | Budget | Quality |
 |---|---|---|
-| `TASK_MODEL` | `google/gemini-2.5-flash-lite` | Same |
-| Task route | `google-vertex/eu` | Same |
-| `REFLECTION_MODEL` | `deepseek/deepseek-chat-v3.1` | `anthropic/claude-sonnet-4.5` |
-| Reflection route | `deepinfra/fp4` | `claude-on-aws` |
+| `TASK_MODEL` | `deepseek/deepseek-v4.1-flash-1017` | Same |
+| Task route | `deepinfra/fp8` | Same |
+| `REFLECTION_MODEL` | `deepseek/deepseek-v4.1-flash-1017` | `openai/gpt-6-sol` |
+| Reflection route | `deepinfra/fp8` | `openai` |
 | `TEMPERATURE` | 0.0 | 0.0 |
 | `MAX_OUTPUT_TOKENS` | 2,048 | 2,048 |
 | Reflection temperature / maximum output | 1.0 / 4,096 | 1.0 / 4,096 |
 | GEPA metric-call target | 120 | 120 |
 | `MAX_OPTIMIZATION_CALLS` | 160 total dispatch attempts | 160 total dispatch attempts |
-| `MAX_OPTIMIZATION_COST_USD` | 2.00 | 8.00 |
+| `MAX_OPTIMIZATION_COST_USD` | 2.00 | 5.00 |
 | Local cache / concurrency / automatic retries | Off / 1 / 0 | Off / 1 / 0 |
 | Reflection minibatch / seed | 3 / 42 | 3 / 42 |
 
-Do not enable extended reasoning by default. Where supported, request reasoning disabled explicitly and verify the actual result/cap in preflight; otherwise disclose the mode and include all billed reasoning tokens in output reservation/accounting. Do not silently allow an LM constructor to raise `max_tokens` or change temperature for a reasoning-model family. The table uses mature model IDs with advertised structured-output support instead of assuming the newest catalog entry is already supported by LiteLLM.
+Do not enable extended reasoning by default. Where supported, request reasoning disabled explicitly and verify the actual result/cap in preflight; otherwise disclose the mode and include all billed reasoning tokens in output reservation/accounting. Do not silently allow an LM constructor to raise `max_tokens` or change temperature for a reasoning-model family. The table pins exact catalog IDs and provider tags with advertised structured-output support; account availability and LiteLLM passthrough remain preflight checks.
 
 OpenRouter documents `reasoning.enabled=false` for disabling reasoning where supported and reports per-model reasoning capabilities/mandatory status in the model catalog. `reasoning.exclude=true` or legacy `include_reasoning=false` merely hides reasoning text; it does not stop its billing. Reasoning generally shares `max_tokens` with visible output, but the documentation says "most providers", not all: verify the selected route's billable output bound/overhead, or refuse a strict reservation that assumes an unsupported bound. An empty final answer caused by exhausting tokens on thinking is an execution/output failure, not a clean findings list.
 
-Route each LM with its own single selected provider tag, `only`/`order`, `allow_fallbacks=false`, and `require_parameters=true`. The OpenRouter `provider.max_price` object uses **USD per million tokens** for `prompt`/`completion`, while endpoint-catalog rates are **USD per token**. Use task ceilings 0.10/0.40, Budget reflection 0.25/0.95, and Quality reflection ceilings that deliberately account for the documented 6.00/22.50 long-context tier. Request/per-image price ceilings are separate units; this app does not enable image or paid server-tool features.
+Route each LM with its own single selected provider tag, `only`/`order`, `allow_fallbacks=false`, and `require_parameters=true`. The OpenRouter `provider.max_price` object uses **USD per million tokens** for `prompt`/`completion`, while endpoint-catalog rates are **USD per token**. Use task and Budget-reflection ceilings 0.098/0.294, and GPT-6 Sol ceilings that deliberately account for the documented 4.00/15.00 long-context tier with 5.00 cache writes. Request/per-image price ceilings are separate units; this app does not enable image or paid server-tool features.
 
 A base provider slug can match several regions or variants. Use the verified full tag where present and record the actual endpoint/provider; `order` alone is not a proof of an exact backend. Do not opt into Flex/Priority service tiers. Set `data_collection="deny"`; optional ZDR enforcement must be preflighted and frozen, since it can eliminate the chosen route. If the route is unavailable, stop rather than automatically relaxing privacy or fallback settings.
 
@@ -542,7 +542,7 @@ Callbacks cannot abort a dispatch in 3.4.1 because their exceptions are logged a
 
 The enforceable local guarantee is against the configured, verified reservation bounds. It is not a promise to control undocumented provider billing changes. Use a dedicated OpenRouter key with an appropriate provider-side spend limit as an additional guard; account-level usage by another application must not share this experiment's key. Show any provider-side limit/reset caveats rather than advertising a mathematically exact invoice cap based on estimated token counts.
 
-Worked unit check for Quality reflection, with no cache writes or other paid features: reserving a full 1,000,000 input tokens at 6.00 USD per million and 4,096 output tokens at 22.50 USD per million gives `1,000,000*6/1,000,000 + 4,096*22.5/1,000,000 = 6.09216 USD`. This fits the 8.00 USD cap only while prior committed cost plus unresolved reservations is at most 1.90784 USD. It is not a guarantee that every possible 160-attempt search will finish. This deliberately conservative upper bound may stop a long run early; lowering it requires a genuinely verified token bound, not an empirical `characters/4` guess.
+Worked unit check for the strong GPT-6 Sol reflection route, with no cache writes or other paid features: reserving a full 1,050,000 input tokens at 4.00 USD per million and 4,096 output tokens at 15.00 USD per million gives `1,050,000*4/1,000,000 + 4,096*15/1,000,000 = 4.26144 USD`. This fits the 5.00 USD cap only while prior committed cost plus unresolved reservations is at most 0.73856 USD. It is not a guarantee that every possible 160-attempt search will finish. This deliberately conservative upper bound may stop a long run early; lowering it requires a genuinely verified token bound, not an empirical `characters/4` guess.
 
 On interrupted compilation preserve events, requests, and status. Save a selected program only if GEPA actually returned one or a verified API exposes a complete candidate. Do not fabricate an optimized artifact from partial logs, promise arbitrary checkpoint resumption, or auto-restart a paid optimization.
 
@@ -904,9 +904,8 @@ All online observations are dated 2026-10-18 UTC. Public documentation/catalog r
 - Pinned predictor instruction/demo state: https://raw.githubusercontent.com/stanfordnlp/dspy/3.4.1/dspy/predict/predict.py
 - Pinned error/retry and AdapterParseError contracts: https://raw.githubusercontent.com/stanfordnlp/dspy/3.4.1/dspy/utils/exceptions.py
 - OpenRouter live model catalog: https://openrouter.ai/api/v1/models
-- Independently fetched task endpoint metadata/pricing: https://openrouter.ai/api/v1/models/google/gemini-2.5-flash-lite/endpoints
-- Independently fetched Budget reflection endpoint metadata/pricing: https://openrouter.ai/api/v1/models/deepseek/deepseek-chat-v3.1/endpoints
-- Independently fetched Quality reflection endpoint metadata, long-context and cache-write overrides: https://openrouter.ai/api/v1/models/anthropic/claude-sonnet-4.5/endpoints
+- Independently fetched task and cheap-reflection endpoint metadata/pricing: https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints
+- Independently fetched strong-reflection endpoint metadata, long-context and cache-write overrides: https://openrouter.ai/api/v1/models/openai/gpt-6-sol/endpoints
 - OpenRouter routing, exact-provider semantics, and `max_price` units: https://openrouter.ai/docs/features/provider-routing
 - OpenRouter structured outputs: https://openrouter.ai/docs/features/structured-outputs
 - OpenRouter usage accounting: https://openrouter.ai/docs/use-cases/usage-accounting

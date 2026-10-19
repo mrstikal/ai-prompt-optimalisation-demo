@@ -39,9 +39,9 @@ pytestmark = pytest.mark.filterwarnings(
     "ignore:Passing OpenAI-style message dictionaries.*:DeprecationWarning"
 )
 
-MODEL = "openrouter/google/gemini-2.5-flash-lite"
-MODEL_BARE = "google/gemini-2.5-flash-lite"
-PROVIDER = "google-vertex/eu"
+MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+MODEL_BARE = "deepseek/deepseek-v4.1-flash-1017"
+PROVIDER = "deepinfra/fp8"
 SECRET = "sk-or-v1-super-secret"
 CONTEXT_LIMIT = 1000
 MAX_OUTPUT = 100
@@ -463,7 +463,7 @@ def test_invalid_prices_and_routes_are_rejected() -> None:
         ModelPricing(Decimal("Infinity"), Decimal("1"))
     with pytest.raises(ValueError):
         ModelRoute(
-            model="openrouter/google/gemini-2.5-flash-lite",
+            model="openrouter/deepseek/deepseek-v4.1-flash-1017",
             provider=PROVIDER,
             context_limit=1000,
             max_output_tokens=100,
@@ -663,7 +663,7 @@ def test_budget_limits_from_settings() -> None:
         env={"OPENROUTER_API_KEY": "sk-or-v1-test"},
     )
     assert settings.optimization_budget() == BudgetLimits(
-        "optimization", 160, Decimal("2.00")
+        "optimization", 160, Decimal("5.00")
     )
     assert settings.baseline_dev_budget() == BudgetLimits(
         "baseline_dev", 10, Decimal("0.50")
@@ -672,13 +672,13 @@ def test_budget_limits_from_settings() -> None:
         "benchmark", 20, Decimal("0.50")
     )
     assert settings.playground_budget() == BudgetLimits(
-        "playground", 2, Decimal("0.10")
+        "playground", 2, Decimal("0.15")
     )
     ledger = BudgetLedger.from_limits(
         settings.optimization_budget()
     )
     assert ledger.max_calls == 160
-    assert ledger.max_cost_usd == Decimal("2.00")
+    assert ledger.max_cost_usd == Decimal("5.00")
 
 
 def test_budget_configuration_validation() -> None:
@@ -1048,8 +1048,9 @@ def test_model_route_factory_uses_frozen_profiles() -> None:
     assert task.context_limit == 1_048_576
     assert task.max_output_tokens == settings.max_output_tokens
     assert task.expected_schema_mode == "native"
-    assert task.pricing.input_usd_per_million == Decimal("0.10")
-    assert reflection.expected_schema_mode == "json_object"
+    assert task.pricing.input_usd_per_million == Decimal("0.098")
+    assert task.pricing.output_usd_per_million == Decimal("0.294")
+    assert reflection.expected_schema_mode == "native"
     assert reflection.max_output_tokens == (
         settings.reflection_max_output_tokens
     )
@@ -1076,7 +1077,7 @@ def test_build_guarded_lm_pins_route_and_does_not_dispatch() -> None:
     )
     assert reflection.kwargs["temperature"] == settings.reflection_temperature
     assert task.supports_response_schema is True
-    assert reflection.supports_response_schema is False
+    assert reflection.supports_response_schema is True
     assert len(ledger.records) == 0
 
 

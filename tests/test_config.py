@@ -92,9 +92,9 @@ def test_live_environment_overrides_are_parsed_exactly() -> None:
         env={
             **BASE_LIVE_ENV,
             "TASK_MODEL": "openai/gpt-4.1-mini",
-            "REFLECTION_MODEL": "anthropic/claude-sonnet-4.5",
+            "REFLECTION_MODEL": "openai/gpt-6-sol",
             "TASK_PROVIDER": "openai",
-            "REFLECTION_PROVIDER": "claude-on-aws",
+            "REFLECTION_PROVIDER": "openai",
             "TEMPERATURE": "0.2",
             "MAX_OUTPUT_TOKENS": "1024",
             "REFLECTION_TEMPERATURE": "0.9",
@@ -113,9 +113,9 @@ def test_live_environment_overrides_are_parsed_exactly() -> None:
         },
     )
     assert settings.task_model == "openai/gpt-4.1-mini"
-    assert settings.reflection_model == "anthropic/claude-sonnet-4.5"
+    assert settings.reflection_model == "openai/gpt-6-sol"
     assert settings.task_provider == "openai"
-    assert settings.reflection_provider == "claude-on-aws"
+    assert settings.reflection_provider == "openai"
     assert settings.temperature == 0.2
     assert settings.max_output_tokens == 1024
     assert settings.reflection_temperature == 0.9
@@ -136,13 +136,13 @@ def test_live_environment_overrides_are_parsed_exactly() -> None:
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("TASK_MODEL", "openrouter/google/gemini-2.5-flash-lite"),
-        ("TASK_MODEL", "google/gemini-2.5-flash-lite:free"),
-        ("TASK_MODEL", "google/gemini-2.5-flash-lite:batch"),
-        ("TASK_MODEL", "google/gemini-2.5-flash-lite:nitro"),
-        ("TASK_MODEL", "google/gemini-2.5-flash-lite:floor"),
-        ("TASK_MODEL", "google/gemini-2.5-flash-lite:latest"),
-        ("TASK_MODEL", "google/gemini-latest"),
+        ("TASK_MODEL", "openrouter/deepseek/deepseek-v4.1-flash-1017"),
+        ("TASK_MODEL", "deepseek/deepseek-v4.1-flash-1017:free"),
+        ("TASK_MODEL", "deepseek/deepseek-v4.1-flash-1017:batch"),
+        ("TASK_MODEL", "deepseek/deepseek-v4.1-flash-1017:nitro"),
+        ("TASK_MODEL", "deepseek/deepseek-v4.1-flash-1017:floor"),
+        ("TASK_MODEL", "deepseek/deepseek-v4.1-flash-1017:latest"),
+        ("TASK_MODEL", "deepseek/deepseek-v4.1-flash-latest"),
         ("TASK_MODEL", "google/latest"),
         ("TASK_MODEL", "not-a-model"),
         ("TASK_MODEL", "google/"),
@@ -212,16 +212,16 @@ def test_secret_is_not_exposed_in_repr_or_redacted_output() -> None:
 
 def test_litellm_prefix_is_added_exactly_once() -> None:
     assert (
-        to_litellm_model_id("google/gemini-2.5-flash-lite")
-        == "openrouter/google/gemini-2.5-flash-lite"
+        to_litellm_model_id("deepseek/deepseek-v4.1-flash-1017")
+        == "openrouter/deepseek/deepseek-v4.1-flash-1017"
     )
     with pytest.raises(InvalidConfigurationError):
-        to_litellm_model_id("openrouter/google/gemini-2.5-flash-lite")
+        to_litellm_model_id("openrouter/deepseek/deepseek-v4.1-flash-1017")
 
 
 def test_validate_model_id_returns_the_trimmed_bare_id() -> None:
-    assert validate_model_id("  google/gemini-2.5-flash-lite  ") == (
-        "google/gemini-2.5-flash-lite"
+    assert validate_model_id("  deepseek/deepseek-v4.1-flash-1017  ") == (
+        "deepseek/deepseek-v4.1-flash-1017"
     )
 
 
@@ -257,30 +257,49 @@ def test_default_provider_routes_are_frozen() -> None:
     assert task.provider == DEFAULT_TASK_PROVIDER
     assert task.expected_schema_mode == "native"
     assert task.context_limit == 1_048_576
-    assert task.input_usd_per_million == Decimal("0.10")
-    assert task.output_usd_per_million == Decimal("0.40")
+    assert task.endpoint_max_output_tokens == 131_072
+    assert task.input_usd_per_million == Decimal("0.098")
+    assert task.output_usd_per_million == Decimal("0.294")
     assert reflection.model == DEFAULT_REFLECTION_MODEL
     assert reflection.provider == DEFAULT_REFLECTION_PROVIDER
-    assert reflection.expected_schema_mode == "json_object"
-    assert reflection.context_limit == 163_840
-    assert reflection.input_usd_per_million == Decimal("0.25")
-    assert reflection.output_usd_per_million == Decimal("0.95")
+    assert reflection.expected_schema_mode == "native"
+    assert reflection.context_limit == 1_050_000
+    assert reflection.endpoint_max_output_tokens == 128_000
+    assert reflection.input_usd_per_million == Decimal("4.00")
+    assert reflection.output_usd_per_million == Decimal("15.00")
+    assert reflection.cache_write_usd_per_million == Decimal("5.00")
 
 
-def test_quality_reflection_route_is_predeclared() -> None:
+def test_cheap_reflection_route_is_predeclared() -> None:
     settings = load_settings(
         mode="live",
         env={
             **BASE_LIVE_ENV,
-            "REFLECTION_MODEL": "anthropic/claude-sonnet-4.5",
-            "REFLECTION_PROVIDER": "claude-on-aws",
+            "REFLECTION_MODEL": "deepseek/deepseek-v4.1-flash-1017",
+            "REFLECTION_PROVIDER": "deepinfra/fp8",
         },
     )
     reflection = settings.reflection_route()
-    assert reflection.expected_schema_mode == "native"
-    assert reflection.context_limit == 1_000_000
-    assert reflection.input_usd_per_million == Decimal("6.00")
-    assert reflection.output_usd_per_million == Decimal("22.50")
+    assert reflection.expected_schema_mode == "json_object"
+    assert reflection.context_limit == 1_048_576
+    assert reflection.endpoint_max_output_tokens == 131_072
+    assert reflection.input_usd_per_million == Decimal("0.098")
+    assert reflection.output_usd_per_million == Decimal("0.294")
+
+
+def test_same_cheap_model_can_serve_both_roles() -> None:
+    settings = load_settings(
+        mode="live",
+        env={
+            **BASE_LIVE_ENV,
+            "TASK_MODEL": "deepseek/deepseek-v4.1-flash-1017",
+            "TASK_PROVIDER": "deepinfra/fp8",
+            "REFLECTION_MODEL": "deepseek/deepseek-v4.1-flash-1017",
+            "REFLECTION_PROVIDER": "deepinfra/fp8",
+        },
+    )
+    assert settings.task_route().expected_schema_mode == "native"
+    assert settings.reflection_route().expected_schema_mode == "json_object"
 
 
 def test_unknown_route_fails_closed() -> None:

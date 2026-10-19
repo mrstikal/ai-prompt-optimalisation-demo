@@ -31,8 +31,8 @@ from dspy_lab.preflight import (
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data/v1"
 SECRET = "sk-or-v1-preflight-secret"
-TASK_MODEL = "google/gemini-2.5-flash-lite"
-REFLECTION_MODEL = "deepseek/deepseek-chat-v3.1"
+TASK_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+REFLECTION_MODEL = "openai/gpt-6-sol"
 
 
 def live_settings(**overrides: str) -> Settings:
@@ -46,8 +46,8 @@ def live_settings(**overrides: str) -> Settings:
 def catalog_payload(
     profile: ProviderRouteProfile,
     *,
-    prompt: str = "0.0000001",
-    completion: str = "0.0000004",
+    prompt: str = "0.000000098",
+    completion: str = "0.000000294",
     cache_write: str | None = None,
     overrides: list[dict[str, object]] | None = None,
     context_length: int | None = None,
@@ -199,23 +199,19 @@ def test_catalog_parser_accepts_the_frozen_route() -> None:
 
 
 def test_catalog_parser_uses_maximum_override_price() -> None:
-    settings = live_settings(
-        REFLECTION_MODEL="anthropic/claude-sonnet-4.5",
-        REFLECTION_PROVIDER="claude-on-aws",
-    )
+    settings = live_settings()
     profile = settings.reflection_route()
     payload = catalog_payload(
         profile,
-        prompt="0.000003",
-        completion="0.000015",
-        cache_write="0.00000375",
+        prompt="0.000002",
+        completion="0.00001",
+        cache_write="0.0000025",
         overrides=[
             {
-                "min_prompt_tokens": 200000,
-                "prompt": "0.000006",
-                "completion": "0.0000225",
-                "input_cache_write": "0.0000075",
-                "input_cache_write_1h": "0.000012",
+                "min_prompt_tokens": 272000,
+                "prompt": "0.000004",
+                "completion": "0.000015",
+                "input_cache_write": "0.000005",
             }
         ],
     )
@@ -332,15 +328,21 @@ def test_preflight_passes_with_exactly_two_task_and_one_reflection_call(
 
     def fake_catalog(model, **kwargs):
         if model == task_profile.model:
-            return catalog_payload(
-                task_profile,
-                cache_write="0.0000000833333333333333",
-            )
+            return catalog_payload(task_profile)
         if model == reflection_profile.model:
             return catalog_payload(
                 reflection_profile,
-                prompt="0.00000025",
-                completion="0.00000095",
+                prompt="0.000002",
+                completion="0.00001",
+                cache_write="0.0000025",
+                overrides=[
+                    {
+                        "min_prompt_tokens": 272000,
+                        "prompt": "0.000004",
+                        "completion": "0.000015",
+                        "input_cache_write": "0.000005",
+                    }
+                ],
             )
         raise AssertionError(f"unexpected model {model}")
 
@@ -385,8 +387,8 @@ def test_preflight_passes_with_exactly_two_task_and_one_reflection_call(
         for record in task_records
     )
     assert all(
-        record["request_kwargs"]["response_format"]
-        == {"type": "json_object"}
+        record["request_kwargs"]["response_format"]["type"]
+        == "json_schema"
         for record in reflection_records
     )
     assert (
@@ -650,11 +652,13 @@ def test_fetch_endpoint_catalog_uses_public_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(
         "dspy_lab.preflight.urllib.request.urlopen", fake_urlopen
     )
-    payload = fetch_endpoint_catalog("google/gemini-2.5-flash-lite")
+    payload = fetch_endpoint_catalog(
+        "deepseek/deepseek-v4.1-flash-1017"
+    )
     assert payload["data"]["endpoints"] == []
     assert captured["url"] == (
         "https://openrouter.ai/api/v1/models/"
-        "google/gemini-2.5-flash-lite/endpoints"
+        "deepseek/deepseek-v4.1-flash-1017/endpoints"
     )
     assert captured["timeout"] == 30.0
     assert "Authorization" not in captured["headers"]

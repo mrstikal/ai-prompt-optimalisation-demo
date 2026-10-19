@@ -139,11 +139,11 @@ def _request(call_id: str, sequence: int) -> dict[str, object]:
         "call_id": call_id,
         "sequence": sequence,
         "phase": "task",
-        "model": "openrouter/google/gemini-2.5-flash-lite",
-        "provider": "google-vertex/eu",
+        "model": "openrouter/deepseek/deepseek-v4.1-flash-1017",
+        "provider": "deepinfra/fp8",
         "status": "succeeded",
         "cost_status": "estimated",
-        "reserved_cost_usd": "0.1056768",
+        "reserved_cost_usd": "0.10336256",
         "estimated_cost_usd": "0.001",
         "reported_cost_usd": "0.001",
         "input_token_bound": 1_048_576,
@@ -151,7 +151,7 @@ def _request(call_id: str, sequence: int) -> dict[str, object]:
         "input_tokens": 100,
         "output_tokens": 5,
         "generation_id": f"gen-{sequence}",
-        "response_model": "openrouter/google/gemini-2.5-flash-lite",
+        "response_model": "openrouter/deepseek/deepseek-v4.1-flash-1017",
         "finish_reason": "stop",
         "error": None,
         "released_reason": None,
@@ -750,12 +750,12 @@ def test_runtime_lm_reattachment_uses_guarded_lm(
     )
     ledger = BudgetLedger(max_calls=1, max_cost_usd=Decimal("1"))
     route = ModelRoute(
-        model="google/gemini-2.5-flash-lite",
-        provider="google-vertex/eu",
+        model="deepseek/deepseek-v4.1-flash-1017",
+        provider="deepinfra/fp8",
         context_limit=1_048_576,
         max_output_tokens=2048,
         pricing=ModelPricing(
-            Decimal("0.10"), Decimal("0.40")
+            Decimal("0.098"), Decimal("0.294")
         ),
         expected_schema_mode="native",
     )
@@ -838,11 +838,11 @@ def test_sent_trace_accepts_slots_request_record() -> None:
         call_id="call-dataclass",
         sequence=1,
         phase="task",
-        model="openrouter/google/gemini-2.5-flash-lite",
-        provider="google-vertex/eu",
+        model="openrouter/deepseek/deepseek-v4.1-flash-1017",
+        provider="deepinfra/fp8",
         status="succeeded",
         cost_status="estimated",
-        reserved_cost_usd=Decimal("0.1056768"),
+        reserved_cost_usd=Decimal("0.10336256"),
         estimated_cost_usd=Decimal("0.001"),
         reported_cost_usd=Decimal("0.001"),
         input_token_bound=1_048_576,
@@ -850,7 +850,7 @@ def test_sent_trace_accepts_slots_request_record() -> None:
         input_tokens=100,
         output_tokens=5,
         generation_id="gen-dataclass",
-        response_model="openrouter/google/gemini-2.5-flash-lite",
+        response_model="openrouter/deepseek/deepseek-v4.1-flash-1017",
         finish_reason="stop",
         error=None,
         released_reason=None,
