@@ -4,7 +4,7 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S6 implemented.** S1 establishes the isolated Python
+**Status: S1-S7 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
@@ -15,9 +15,12 @@ deterministic evidence matcher, corpus and per-category metrics, clean-case
 reward, and the scalar/GEPA feedback interfaces, backed by hand-computed unit
 fixtures and dataset-level self-match checks. S6 adds the frozen one-predictor
 DSPy baseline, the strict JSON adapter, the canonical four-input whitelist, the
-baseline fingerprint/manifest, and offline scripted-transport tests. The UI,
-provider calls, optimization, benchmark, and Replay archive are not implemented.
-No paid API call has been made.
+baseline fingerprint/manifest, and offline scripted-transport tests. S7 adds the
+strict-budget guarded LM, one shared atomic request ledger, conservative Decimal
+reservations, reconciliation for unknown costs, cancellation/budget-stop
+semantics, request telemetry, and secret redaction, all tested against a mocked
+LiteLLM transport. The UI, provider preflight, optimization, benchmark, and
+Replay archive are not implemented. No paid API call has been made.
 
 ## Requirements
 
@@ -151,6 +154,31 @@ uv run python -c \
   gold leakage, and integrates the resulting `dspy.Prediction` with the S5
   metric.
 
+## Budget guard and request ledger (S7)
+
+- `src/dspy_lab/llm.py` defines `GuardedLM`, a genuine `dspy.LM` with
+  `engine="litellm"` that reserves one attempt and a conservative Decimal USD
+  amount before delegating. It enforces `num_retries=0`, `cache=False`, `n=1`,
+  the configured output cap, and the expected schema mode.
+- One `BudgetLedger` is shared by task and reflection LMs and by
+  `.copy()`/`copy.copy`/`copy.deepcopy`, so a copy cannot reset a budget. Its
+  lock makes concurrent admission atomic. The call cap and USD cap are
+  inclusive at the boundary.
+- By default the input reservation uses the full admissible context bound; an
+  optional verified token counter plus formatting overhead can reduce it.
+  `ModelPricing` keeps Decimal USD-per-million rates, converts from catalog
+  USD-per-token rates, and includes request/cache-write charges.
+- `BudgetExceeded`/`BudgetCancelled` are execution-control `BudgetStop`
+  exceptions, not quality failures. A stop persists: later calls are rejected
+  without dispatch even if a library catches the exception.
+- Every request record preserves phase/model/provider, messages, sanitized
+  request parameters, reservation, generation ID, token usage, finish reason,
+  estimated/actual cost status, and errors with secrets redacted. Unknown-cost
+  and timeout reservations remain unresolved until `reconcile()`.
+- `Settings.optimization_budget()`, `baseline_dev_budget()`,
+  `benchmark_budget()`, and `playground_budget()` expose the named
+  `BudgetLimits` phases.
+
 ## Frozen API contracts
 
 These are the version-specific contracts S1 is pinned against. Later stages
@@ -204,14 +232,18 @@ disjointness, near-duplicate checks, the 50-entry review audit, the frozen split
 manifest, deterministic scoring and maximum-cardinality matching, duplicate and
 evidence-failure accounting, undefined-ratio behavior, scalar/GEPA wrapper
 agreement, one-predictor DSPy baseline behavior, strict JSON/native-schema
-requests, zero-demo fingerprint stability, no gold leakage, and rejection of the
-sealed test path by the optimization loader.
+requests, zero-demo fingerprint stability, no gold leakage, exact budget
+reservation/call caps, shared-ledger copies, concurrent admission, unknown-cost
+retention, cancellation, real adapter fallback accounting, price-unit
+conversion, secret redaction, and rejection of the sealed test path by the
+optimization loader.
 
 ## Scope and limitations
 
-S1-S6 complete the 50-case dataset, seal the held-out test split, provide
-deterministic scoring and GEPA feedback, and freeze the one-predictor DSPy
-baseline with a strict adapter. They do not implement the Streamlit screens,
-budget guard, provider preflight, optimization, benchmark, or Replay archive.
-Those stages remain in `dspy_plan.md` sections 12-15. The host Python 3.15.0
-installation is untouched; only this project's isolated environment uses 3.14.8.
+S1-S7 complete the 50-case dataset, seal the held-out test split, provide
+deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
+with a strict adapter, and add the strict-budget guarded LM/ledger. They do not
+implement the Streamlit screens, provider preflight, optimization, benchmark, or
+Replay archive. Those stages remain in `dspy_plan.md` sections 12-15. The host
+Python 3.15.0 installation is untouched; only this project's isolated
+environment uses 3.14.8.

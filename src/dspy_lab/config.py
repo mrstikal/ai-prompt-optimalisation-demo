@@ -82,6 +82,41 @@ class UnsupportedPythonError(ConfigurationError):
 
 
 @dataclass(frozen=True, slots=True)
+class BudgetLimits:
+    """One named phase's application-level attempt and USD limits."""
+
+    phase: str
+    max_calls: int
+    max_cost_usd: Decimal
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.phase, str) or not self.phase.strip():
+            raise InvalidConfigurationError(
+                "budget phase must be a non-empty string"
+            )
+        if any(char.isspace() for char in self.phase):
+            raise InvalidConfigurationError(
+                "budget phase must not contain whitespace"
+            )
+        if (
+            isinstance(self.max_calls, bool)
+            or not isinstance(self.max_calls, int)
+            or self.max_calls < 1
+        ):
+            raise InvalidConfigurationError(
+                "budget max_calls must be a positive integer"
+            )
+        if (
+            not isinstance(self.max_cost_usd, Decimal)
+            or not self.max_cost_usd.is_finite()
+            or self.max_cost_usd <= 0
+        ):
+            raise InvalidConfigurationError(
+                "budget max_cost_usd must be a positive finite Decimal"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Validated settings shared by the Live workflow and offline tests."""
 
@@ -105,6 +140,34 @@ class Settings:
     max_playground_calls: int = DEFAULT_MAX_PLAYGROUND_CALLS
     max_playground_cost_usd: Decimal = DEFAULT_MAX_PLAYGROUND_COST_USD
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+    def optimization_budget(self) -> BudgetLimits:
+        return BudgetLimits(
+            "optimization",
+            self.max_optimization_calls,
+            self.max_optimization_cost_usd,
+        )
+
+    def baseline_dev_budget(self) -> BudgetLimits:
+        return BudgetLimits(
+            "baseline_dev",
+            self.max_baseline_dev_calls,
+            self.max_baseline_dev_cost_usd,
+        )
+
+    def benchmark_budget(self) -> BudgetLimits:
+        return BudgetLimits(
+            "benchmark",
+            self.max_benchmark_calls,
+            self.max_benchmark_cost_usd,
+        )
+
+    def playground_budget(self) -> BudgetLimits:
+        return BudgetLimits(
+            "playground",
+            self.max_playground_calls,
+            self.max_playground_cost_usd,
+        )
 
     def redacted(self) -> dict[str, object]:
         """Return a display-safe mapping that never exposes the API key."""
