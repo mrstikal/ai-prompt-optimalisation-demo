@@ -1,0 +1,57 @@
+{
+  "call_id": "call-s8-fixture-1",
+  "sequence": 1,
+  "phase": "task",
+  "model": "openrouter/google/gemini-2.5-flash-lite",
+  "provider": "google-vertex/eu",
+  "status": "succeeded",
+  "cost_status": "estimated",
+  "reserved_cost_usd": "0.1056768",
+  "estimated_cost_usd": "0.0000123",
+  "reported_cost_usd": "0.0000123",
+  "input_token_bound": 1048576,
+  "output_token_bound": 2048,
+  "input_tokens": 512,
+  "output_tokens": 24,
+  "generation_id": "gen-s8-fixture-1",
+  "response_model": "openrouter/google/gemini-2.5-flash-lite",
+  "finish_reason": "stop",
+  "error": null,
+  "released_reason": null,
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a Czech precious-metals editorial reviewer."
+    },
+    {
+      "role": "user",
+      "content": "Article: Zlatý slitek o hmotnosti 1 g. Return the strict findings JSON."
+    }
+  ],
+  "request_kwargs": {
+    "model": "openrouter/google/gemini-2.5-flash-lite",
+    "max_tokens": 2048,
+    "temperature": 0.0,
+    "response_format": {
+      "type": "json_schema",
+      "strict": true
+    },
+    "extra_body": {
+      "provider": {
+        "only": ["google-vertex/eu"],
+        "order": ["google-vertex/eu"],
+        "allow_fallbacks": false,
+        "require_parameters": true,
+        "data_collection": "deny"
+      },
+      "reasoning": {"enabled": false}
+    }
+  },
+  "usage": {
+    "prompt_tokens": 512,
+    "completion_tokens": 24,
+    "total_tokens": 536
+  },
+  "started_at": "2026-10-19T17:00:00Z",
+  "finished_at": "2026-10-19T17:00:01Z"
+}

@@ -4,7 +4,7 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S8 implemented.** S1 establishes the isolated Python
+**Status: S1-S9 implemented.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
@@ -22,8 +22,11 @@ semantics, request telemetry, and secret redaction, all tested against a mocked
 LiteLLM transport. S8 adds frozen OpenRouter route profiles, strict
 single-provider routing, public endpoint-catalog snapshots, an explicitly
 confirmed three-call compatibility preflight, and local JSON preflight records.
-The UI, optimization, benchmark, and Replay archive are not implemented. No
-paid API call has been made.
+S9 adds atomic state-only program artifacts, linked development/optimization/
+benchmark run manifests with exact case/rule snapshots, a strictly offline
+Replay reader, and shared sent-versus-preview trace formatting. The Streamlit
+UI, optimization, and benchmark engine are not implemented. No paid API call
+has been made.
 
 ## Requirements
 
@@ -224,6 +227,50 @@ reservation does not fit the cap. Catalog metadata requests are public and
 cost no tokens, but they do require network access. Do not run the command
 until the separate preflight budget has been approved.
 
+## Artifacts and Replay (S9)
+
+- Programs are saved under `artifacts/programs/<program_id>/` as
+  `program.json` (trusted DSPy state only), `manifest.json`, and
+  `instructions.txt`. The manifest records the content-derived program ID,
+  parent/creation IDs, origin (`live` or `mock_test`), zero demos, `lm: null`,
+  full signature schema, rules/prompt/source hashes, dependency versions,
+  state hash/size, and checksums. No benchmark score or credential is stored.
+- Saving creates the artifact in a temporary sibling directory, scans for
+  configured secret values (including `OPENROUTER_API_KEY` by default) and
+  credential-bearing keys, then atomically renames the directory. File writes
+  use a temporary file, `fsync`, mode 0600, and `os.replace`; an interrupted
+  write cannot appear complete. Run files are scanned for the same configured
+  secrets without a size-based skip.
+- Live loading requires `origin=live` unless `allow_mock=True` is explicit, and
+  checks the manifest/schema/state hashes, rules/prompt/source identity,
+  adapter version, and exact Python/application/DSPy/GEPA/LiteLLM/Pydantic
+  versions before calling the trusted DSPy `.load()`. A mismatch is a clear
+  compatibility error, not a warning or best-effort import. The predictor keeps
+  `lm=None`; Live inference attaches the guarded LM through runtime context.
+- Run records live under
+  `runs/development|optimization|benchmarks|playground/<run_id>/`. A manifest
+  links program IDs and hashes, exact `inputs_snapshot.jsonl` cases, the rules
+  snapshot, outcomes, requests, and optional native GEPA statistics. Development snapshots are validation-only, optimization
+  snapshots are train+validation, and benchmarks are test-only; linked runs
+  must share rules and dataset versions.
+- `open_replay_archive()` validates the benchmark's file hashes, linked
+  development/optimization run IDs, program hashes, exact rule snapshots, and
+  every outcome's case, candidate, arm/phase, program, split, and canonical
+  input hash. It reads only recorded JSON/JSONL/text data: no current-dataset
+  lookup, LM construction, provider/catalog request, GEPA compile, `Predict`,
+  `Evaluate`, or native program `.load()`.
+- Replay exposes `additional_api_calls=0` and `additional_api_cost_usd=0.00`.
+  A completed, released `origin=live` benchmark is the only archive reported as
+  measured. Mock/test archives remain visibly labeled and untrusted for
+  results; missing, incomplete, corrupt, or mismatched records fail explicitly.
+- `format_sent_trace()` preserves the exact recorded messages and provider
+  metadata, including generation ID, usage, and estimated cost.
+  `format_preview_trace()` is a separate type with `sent=false`, no generation
+  ID/usage/cost, and an explicit notice. S8 preflight call records use the same
+  trace shape.
+- No released live archive exists yet. S9 tests build temporary mock archives
+  and never present them as measured results.
+
 ## Frozen API contracts
 
 These are the version-specific contracts S1 is pinned against. Later stages
@@ -290,17 +337,22 @@ retention, cancellation, real adapter fallback accounting, price-unit
 conversion, secret redaction, rejection of the sealed test path by the
 optimization loader, frozen route profiles, single-provider routing, schema
 mode determinism, catalog drift rejection, the exact two-task/one-reflection
-preflight plan, failure records without retries, and preflight budget
-enforcement.
+preflight plan, failure records without retries, preflight budget enforcement,
+state-only program identity/load compatibility, runtime LM reattachment,
+atomic/secret-safe artifacts, linked run and snapshot consistency, offline
+Replay without LM/native loading or current-dataset substitution, mock archive
+labeling, and sent-versus-preview trace separation.
 
 ## Scope and limitations
 
-S1-S8 complete the 50-case dataset, seal the held-out test split, provide
+S1-S9 complete the 50-case dataset, seal the held-out test split, provide
 deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
-with a strict adapter, add the strict-budget guarded LM/ledger, and implement
-the explicitly authorized provider preflight with local records. They do not
-implement the Streamlit screens, optimization, benchmark, or Replay archive.
-Those stages remain in `dspy_plan.md` sections 12-15. No live preflight has
-been run in this repository and no paid API call has been made. The host
+with a strict adapter, add the strict-budget guarded LM/ledger, implement the
+explicitly authorized provider preflight with local records, and add safe
+program/run persistence with a read-only Replay reader. They do not implement
+the Streamlit screens, optimization, benchmark engine, or Replay presentation.
+Those stages remain in `dspy_plan.md` sections 12-15. No live preflight,
+optimization, benchmark, or released archive exists, and no paid API call has
+been made. The host
 Python 3.15.0 installation is untouched; only this project's isolated
 environment uses 3.14.8.
