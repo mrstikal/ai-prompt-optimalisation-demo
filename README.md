@@ -4,7 +4,8 @@ Standalone lab for reviewing Czech precious-metals articles with one DSPy
 predictor and comparing a frozen zero-shot baseline with a genuine GEPA
 instruction-optimized program.
 
-**Status: S1-S11 implemented.** S1 establishes the isolated Python
+**Status: S1-S15 tooling implemented; the paid first held-out run is pending
+operator approval and an API key.** S1 establishes the isolated Python
 environment, dependency lock, package skeleton, and configuration contract. S2
 adds the frozen six-code editorial rules, strict typed schemas,
 canonicalization/offset validation, and the first five training specimens. S3
@@ -42,8 +43,12 @@ corrected/newly missed issue views, candidate navigation, and a read-only
 Replay Playground. Live adds a separately confirmed paired benchmark action
 and an unscored Playground that runs both frozen artifacts on supplied text
 with its own two-call budget; article text is not persisted unless explicitly
-opted in. Replay remains the default and exposes no paid execution path. No
-paid API call has been made.
+opted in. Replay remains the default and exposes no paid execution path. S15 adds the
+offline release validator, the acceptance-report format, the baseline
+development CLI, and the "prepare once with Live, present repeatedly with
+Replay" workflow. The real released archive and its acceptance record cannot be
+produced without an API key and explicit human approval of the separate spend
+caps; no paid API call has been made.
 
 ## Requirements
 
@@ -332,6 +337,117 @@ until the separate preflight budget has been approved.
   reevaluation label. Repeated runs preserve prior IDs and cannot become fresh
   confirmatory evidence retroactively.
 
+## Release Validation and First Held-Out Run (S15)
+
+S15 is an operator stage, not a source of fabricated evidence. The committed
+code can prepare the baseline, run the confirmed Live workflow, and validate a
+genuine released archive offline. This workspace currently has no
+`OPENROUTER_API_KEY`, no `runs/`, and no `artifacts/`, so **no released Live
+archive or first held-out result exists yet**. Mock/test archives must never be
+presented as measured results.
+
+### Prepare once with Live
+
+Do not run these commands until the preflight, baseline development,
+optimization, benchmark, and optional playground budgets have been separately
+approved. The caps are listed in the configuration table above; starting the
+application or running the default test suite never starts a paid job.
+
+```bash
+uv python install 3.14.8
+uv sync --frozen
+uv run python --version          # must report 3.14.8
+uv run pytest                    # offline; no key, no paid call
+cp .env.example .env             # set OPENROUTER_API_KEY locally
+
+# 1. Explicitly confirmed compatibility preflight.
+uv run --env-file .env python -m dspy_lab.preflight \
+  --confirm-preflight-budget
+
+# 2. Explicitly confirmed baseline development evaluation on validation only.
+uv run --env-file .env python -m dspy_lab.release baseline-development \
+  --confirm-budget
+```
+
+The baseline command prints the development run ID. Start the UI and use Live
+Experiment for the remaining phases:
+
+```bash
+uv run streamlit run app.py --server.address 127.0.0.1
+```
+
+1. Open **Optimization**, select the completed development run, review the
+   10-call/0.50 USD baseline and 160-call/5.00 USD optimization caps, check the
+   confirmation box, and start the run. Wait for a completed `optimization` run;
+   a stopped or failed compile remains an honest failed record.
+2. Open **Comparison**, select that optimization run, review the sealed-test
+   warning, the 20-call/0.50 USD benchmark cap, and check **Release the
+   completed benchmark as a measured Replay archive**. Confirm and wait for the
+   completed `benchmark` run.
+3. Optionally open **Playground**, supply a new Czech article and optional
+   references, confirm its separate 2-call/0.15 USD budget, and review the
+   unscored findings/messages/usage/cost/latency.
+
+Validate the released archive offline (no key, no network):
+
+```bash
+uv run python -m dspy_lab.release validate \
+  --benchmark-run-id <benchmark-run-id> \
+  --json runs/release_validation/<benchmark-run-id>-acceptance.json
+```
+
+The validator refuses mock, unreleased, incomplete, corrupt, or hash-mismatched
+archives; recomputes stored metrics/deltas from archived raw findings and gold;
+checks paired inputs, request references, latency structure, cost status,
+exposure/test index, task configs, program snapshots, secret patterns, and
+repeated-read immutability; and exits nonzero if any archive check fails. `A9` and `A10` are
+reported as `not_covered` because they are exercised by the separately
+confirmed Playground and the default test suite, not by a benchmark archive.
+`verified` in the acceptance record means the archive-checkable evidence
+passed; `partial` means the recorded evidence is present but fresh-checkout or
+restart behavior still needs operator/reviewer sign-off.
+
+### Present repeatedly with Replay
+
+Once a genuine released archive exists locally:
+
+```bash
+uv run --offline streamlit run app.py --server.address 127.0.0.1
+```
+
+The app opens in Replay with no API key and no outbound dependency resolution.
+Select the archived experiment and use Overview, Baseline, Optimization,
+Comparison, and Prompt Inspector repeatedly. All prompts, candidates, diffs,
+outputs, metrics, costs, latencies, IDs, hashes, and exposure warnings are read
+from the archive. New inference, GEPA, benchmark creation, and Playground
+inference are unavailable in Replay. Missing archives fail explicitly; they are
+never regenerated or replaced by a fixture.
+
+### Acceptance checklist
+
+| ID | Evidence |
+|---|---|
+| A1 | README setup commands, frozen 3.14.8 environment, offline default tests. |
+| A2 | 50 cases, 30/10/10 splits, sealed test, six-category coverage, frozen hashes. |
+| A3 | Completed linked Live baseline development run with all ten outcomes. |
+| A4 | Completed linked Live GEPA run with native candidate/reflection evidence; unchanged baseline is valid. |
+| A5 | State-only program snapshots with identical instructions/schema, zero demos, one predictor. |
+| A6 | Ten paired test inputs, both arms, identical input hashes, invalid outputs retained. |
+| A7 | Prompt Inspector and release validator read recorded client messages; previews are not marked sent. |
+| A8 | Comparison and validator show metrics, parsing/evidence failures, costs, status, latency, and break-even. |
+| A9 | Separate Live Playground with its own budget and no gold score; Replay cannot run it. |
+| A10 | Default tests cover budget caps, cancellation, secret safety, reproducibility, and rerun protection. |
+| A11 | Linked manifests/configs/outcomes preserve IDs, timestamps, versions, hashes, seed, counts, usage, costs, timing. |
+| A12 | Honest verdict (improved/unchanged/regressed/inconclusive) and original warnings remain visible. |
+| A13 | Released archive reproduced offline after restart with identical IDs/hashes and zero new calls. |
+
+The acceptance record links these IDs to concrete run IDs, artifacts, tests,
+and reviewer sign-off. A bug found after test exposure must be fixed
+transparently; a revised benchmark retains its reuse warning and cannot
+retroactively become the first blind experiment. Until a genuine released
+archive exists, A3/A4/A6/A13 remain pending and must not be claimed as
+accomplished.
+
 ## Artifacts and Replay (S9)
 
 - Programs are saved under `artifacts/programs/<program_id>/` as
@@ -455,11 +571,13 @@ synthetic sealed fixtures, deterministic A/B and B/A ordering, equal input and
 task-config fingerprints, all-error retention, invalid/incomplete gates,
 micro-versus-mean metrics, millisecond latency summaries, actual/estimated
 costs, positive/zero/negative cost savings, no-compile saved-program
-reevaluation, Replay compatibility, and test-reuse exposure history.
+reevaluation, Replay compatibility, test-reuse exposure history, released
+archive acceptance, tampered/unreleased-archive rejection, artifact-hash
+immutability during repeated validation, and zero-dispatch offline validation.
 
 ## Scope and limitations
 
-S1-S14 complete the 50-case dataset, seal the held-out test split, provide
+S1-S15 complete the 50-case dataset, seal the held-out test split, provide
 deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
 with a strict adapter, add the strict-budget guarded LM/ledger, implement the
 explicitly authorized provider preflight with local records, add safe
@@ -469,9 +587,10 @@ benchmark paths, and add the Replay-default UI foundation with Overview,
 Baseline, and Prompt Inspector. S13 adds the single confirmed Live optimization
 job with progress polling and cooperative cancellation, and Comparison plus
 the unscored Playground. Replay never starts or resumes GEPA and cannot run
-Playground inference. Release validation remains in `dspy_plan.md` section 15.
-No live preflight,
-optimization, benchmark, or released archive exists, and no paid API call has
-been made. The host
+Playground inference. S15 adds the offline release validator, baseline
+development CLI, acceptance-record schema, and preparation/presentation
+runbook. No live preflight, optimization, benchmark, or released archive
+exists, and no paid API call has been made; the first held-out run remains
+pending explicit human approval and a configured key. The host
 Python 3.15.0 installation is untouched; only this project's isolated
 environment uses 3.14.8.
