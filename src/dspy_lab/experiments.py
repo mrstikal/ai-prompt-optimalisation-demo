@@ -1603,12 +1603,33 @@ def run_optimization(
     runs_root: Path = RUNS_ROOT,
     programs_root: Path = PROGRAMS_ROOT,
     rules_text: str | None = None,
+    ledger: BudgetLedger | None = None,
 ) -> OptimizationResult:
-    """Compile a fresh baseline copy with genuine ``dspy.GEPA``."""
+    """Compile a fresh baseline copy with genuine ``dspy.GEPA``.
+
+    ``ledger`` may be supplied by a server-side job coordinator so the same
+    per-job ledger can be cancelled before the next dispatch. It must use the
+    exact confirmed optimization limits; a mismatched ledger is rejected
+    before any dispatch.
+    """
     _require_live_settings(settings)
     _require_confirmation(confirm_budget)
     limits = settings.optimization_budget()
     _validate_budget(limits)
+    if ledger is None:
+        ledger = BudgetLedger.from_limits(limits)
+    elif not isinstance(ledger, BudgetLedger):
+        raise ExperimentConfigurationError(
+            "optimization ledger must be a BudgetLedger"
+        )
+    elif (
+        ledger.max_calls != limits.max_calls
+        or ledger.max_cost_usd != limits.max_cost_usd
+    ):
+        raise ExperimentConfigurationError(
+            "injected optimization ledger limits do not match the confirmed "
+            "optimization budget"
+        )
     headroom = _validate_optimization_budget(settings)
     train, validation = _validate_optimization_split(
         train_cases, validation_cases
@@ -1684,7 +1705,6 @@ def run_optimization(
             "fingerprint": expected_fingerprint,
         },
     )
-    ledger = BudgetLedger.from_limits(limits)
     write_lock = threading.Lock()
 
     def listener(record: LedgerRequestRecord) -> None:

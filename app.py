@@ -1,18 +1,23 @@
-"""Read-only Live/Replay foundation for the DSPy prompt optimization lab.
+"""Live/Replay UI for the DSPy prompt optimization lab.
 
-This entrypoint implements the global mode selector plus the Overview,
-Baseline, and Prompt Inspector screens. Replay is the default mode and reads
-only local recorded artifacts. The Live branch in this stage is also read-only:
-it inspects already recorded local runs but cannot start a paid job, browse a
-provider catalog, or construct an LM.
+Replay is the default and reads only local recorded artifacts. Live exposes one
+server-side confirmation-gated optimization job backed by a single local worker
+thread; the worker never calls Streamlit APIs. Overview, Baseline, and Prompt
+Inspector remain read-only in both modes.
 """
 
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import os
+import re
+import secrets
+import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,6 +35,8 @@ from dspy_lab.artifacts import (
     ReplayArchive,
     RunDirectoryEntry,
     RunManifest,
+    append_jsonl,
+    atomic_write_json,
     format_preview_trace,
     format_sent_trace,
     is_measured_archive,
@@ -37,6 +44,7 @@ from dspy_lab.artifacts import (
     open_development_run,
     open_optimization_run,
     open_replay_archive,
+    read_run_manifest,
 )
 from dspy_lab.config import (
     DEFAULT_MAX_OPTIMIZATION_METRIC_CALLS,
@@ -49,9 +57,11 @@ from dspy_lab.config import (
 )
 from dspy_lab.data import (
     canonical_document,
+    load_optimization_cases,
     load_review_audit,
     load_split_manifest,
 )
+from dspy_lab.llm import BudgetLedger, BudgetSnapshot
 from dspy_lab.program import (
     case_inputs,
     load_baseline_instructions,
@@ -144,6 +154,681 @@ class InspectorView:
     warnings: tuple[str, ...]
 
 
+JOB_SCHEMA_VERSION = "ui_job_v1"
+JOB_STATUS_RUNNING = "running"
+JOB_STATUS_CANCELLING = "cancelling"
+JOB_STATUS_COMPLETED = "completed"
+JOB_STATUS_STOPPED = "stopped"
+JOB_STATUS_FAILED = "failed"
+JOB_STATUS_INTERRUPTED = "interrupted"
+JOB_ACTIVE_STATUSES = frozenset(
+    {JOB_STATUS_RUNNING, JOB_STATUS_CANCELLING}
+)
+JOB_RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+JOB_REGISTRY_DIRNAME = "jobs"
+ACTIVE_JOB_LOCK_FILENAME = ".active.lock"
+PROCESS_INSTANCE_ID = secrets.token_hex(8)
+
+
+class JobGateError(RuntimeError):
+    """Base error for rejected server-side job submissions."""
+
+
+class JobBusyError(JobGateError):
+    """Raised when another Live job is already active."""
+
+
+class JobStaleError(JobGateError):
+    """Raised for a consumed token, changed mode, or existing run ID."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _redact_secret(text: str, secret: str | None) -> str:
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    return re.sub(r"sk-or-[A-Za-z0-9._-]+", "[REDACTED]", text)
+
+
+def _token_sha256(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _new_job_run_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ").lower()
+    return f"opt-{stamp}-{secrets.token_hex(3)}"
+
+
+def _process_start_token(pid: object) -> str | None:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    marker = stat.rfind(")")
+    if marker < 0:
+        return None
+    fields = stat[marker + 2 :].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def _pid_alive(pid: object) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_json_file(path: Path) -> Mapping[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def read_active_job_lock(
+    runs_root: Path = RUNS_ROOT,
+) -> Mapping[str, object] | None:
+    """Return the live active-job lock without creating or mutating anything."""
+    path = Path(runs_root) / JOB_REGISTRY_DIRNAME / ACTIVE_JOB_LOCK_FILENAME
+    payload = _read_json_file(path)
+    if payload is None or not _pid_alive(payload.get("pid")):
+        return None
+    if (
+        payload.get("pid") == os.getpid()
+        and payload.get("process_instance_id")
+        not in (None, PROCESS_INSTANCE_ID)
+    ):
+        return None
+    recorded_start = payload.get("process_start_token")
+    current_start = _process_start_token(payload.get("pid"))
+    if (
+        isinstance(recorded_start, str)
+        and current_start is not None
+        and recorded_start != current_start
+    ):
+        return None
+    return payload
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizationJobSpec:
+    mode: str
+    run_id: str
+    token: str
+    mode_epoch: int
+    confirmation_generation: int
+    settings: Settings
+    baseline_development_run_id: str
+    train_cases: tuple[CaseRecord, ...]
+    validation_cases: tuple[CaseRecord, ...]
+    rules_text: str
+    runs_root: Path
+    programs_root: Path
+
+
+@dataclass
+class JobHandle:
+    """One in-process optimization job; the worker never renders Streamlit."""
+
+    run_id: str
+    token_sha256: str
+    mode_epoch: int
+    runs_root: Path
+    programs_root: Path
+    settings: Settings
+    baseline_development_run_id: str
+    train_cases: tuple[CaseRecord, ...]
+    validation_cases: tuple[CaseRecord, ...]
+    rules_text: str
+    ledger: BudgetLedger
+    events_path: Path
+    started_at: str
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )
+    _status: str = JOB_STATUS_RUNNING
+    _error: str | None = None
+    _finished_at: str | None = None
+    _result: object | None = None
+    _thread: threading.Thread | None = field(default=None, repr=False)
+
+    @property
+    def status(self) -> str:
+        with self._lock:
+            return self._status
+
+    @property
+    def error(self) -> str | None:
+        with self._lock:
+            return self._error
+
+    @property
+    def finished_at(self) -> str | None:
+        with self._lock:
+            return self._finished_at
+
+    @property
+    def result(self) -> object | None:
+        with self._lock:
+            return self._result
+
+    @property
+    def active(self) -> bool:
+        return self.status in JOB_ACTIVE_STATUSES
+
+    def request_cancel(self) -> bool:
+        with self._lock:
+            if self._status != JOB_STATUS_RUNNING:
+                return False
+            self._status = JOB_STATUS_CANCELLING
+        self.ledger.cancel("cancelled_by_operator")
+        return True
+
+    def finish(
+        self,
+        status: str,
+        *,
+        error: str | None = None,
+        result: object | None = None,
+    ) -> None:
+        with self._lock:
+            self._status = status
+            self._error = error
+            self._result = result
+            self._finished_at = _utc_now()
+
+    def read_events(
+        self, limit: int = 40
+    ) -> list[Mapping[str, object]]:
+        """Read persisted progress events only; never dispatch a request."""
+        try:
+            lines = self.events_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        events: list[Mapping[str, object]] = []
+        for line in lines[-max(1, limit) :]:
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(payload, Mapping):
+                events.append(payload)
+        return events
+
+    def budget_snapshot(self) -> BudgetSnapshot:
+        return self.ledger.snapshot()
+
+
+class JobManager:
+    """Single-worker coordinator, active-job lock, and consumed-token registry."""
+
+    def __init__(
+        self,
+        runs_root: Path,
+        programs_root: Path,
+        *,
+        runner: Callable[[OptimizationJobSpec, JobHandle], object] | None = None,
+    ) -> None:
+        self._runs_root = Path(runs_root)
+        self._programs_root = Path(programs_root)
+        self._runner = runner or _run_optimization_job
+        self._lock = threading.RLock()
+        self._handle: JobHandle | None = None
+        self._consumed_tokens: set[str] = set()
+        self._mode_epoch = 0
+        self._confirmation_generation = 0
+        self._last_mode: str | None = None
+        self._records: dict[str, dict[str, object]] = {}
+        self._registry_dir = self._runs_root / JOB_REGISTRY_DIRNAME
+        self._active_lock_path = (
+            self._registry_dir / ACTIVE_JOB_LOCK_FILENAME
+        )
+        self._registry_dir.mkdir(parents=True, exist_ok=True)
+        self._recover()
+
+    @property
+    def active_handle(self) -> JobHandle | None:
+        with self._lock:
+            handle = self._handle
+        return handle if handle is not None and handle.active else None
+
+    @property
+    def latest_handle(self) -> JobHandle | None:
+        with self._lock:
+            return self._handle
+
+    @property
+    def mode_epoch(self) -> int:
+        with self._lock:
+            return self._mode_epoch
+
+    @property
+    def confirmation_generation(self) -> int:
+        with self._lock:
+            return self._confirmation_generation
+
+    def note_mode(self, mode: str) -> int:
+        with self._lock:
+            if self._last_mode is None:
+                self._last_mode = mode
+            elif mode != self._last_mode:
+                self._last_mode = mode
+                self._mode_epoch += 1
+            return self._mode_epoch
+
+    def start_job(self, spec: OptimizationJobSpec) -> JobHandle:
+        if spec.mode != MODE_LIVE:
+            raise JobGateError(
+                "paid optimization can start only in Live Experiment"
+            )
+        if not isinstance(spec.settings, Settings):
+            raise JobGateError("a validated Live settings object is required")
+        if not isinstance(spec.token, str) or not spec.token.strip():
+            raise JobStaleError("a fresh confirmation token is required")
+        if JOB_RUN_ID_PATTERN.fullmatch(spec.run_id) is None:
+            raise JobStaleError("invalid optimization run ID")
+        token_hash = _token_sha256(spec.token)
+        with self._lock:
+            if self._handle is not None and self._handle.active:
+                raise JobBusyError(
+                    "another Live optimization job is already active"
+                )
+            if token_hash in self._consumed_tokens:
+                raise JobStaleError(
+                    "this confirmation was already consumed; confirm a new "
+                    "budget"
+                )
+            if spec.mode_epoch != self._mode_epoch:
+                raise JobStaleError(
+                    "the experiment mode changed after this form was "
+                    "prepared; review and confirm a fresh budget"
+                )
+            if (
+                spec.confirmation_generation
+                != self._confirmation_generation
+            ):
+                raise JobStaleError(
+                    "another confirmed job consumed this form generation; "
+                    "review and confirm a fresh budget"
+                )
+            if self._run_exists(spec.run_id):
+                raise JobStaleError(
+                    "this run ID already exists; a stale form cannot start "
+                    "another paid job"
+                )
+            if read_active_job_lock(self._runs_root) is not None:
+                raise JobBusyError(
+                    "another process holds the single active-job lock"
+                )
+            ledger = BudgetLedger.from_limits(
+                spec.settings.optimization_budget()
+            )
+            started_at = _utc_now()
+            handle = JobHandle(
+                run_id=spec.run_id,
+                token_sha256=token_hash,
+                mode_epoch=spec.mode_epoch,
+                runs_root=spec.runs_root,
+                programs_root=spec.programs_root,
+                settings=spec.settings,
+                baseline_development_run_id=spec.baseline_development_run_id,
+                train_cases=spec.train_cases,
+                validation_cases=spec.validation_cases,
+                rules_text=spec.rules_text,
+                ledger=ledger,
+                events_path=(
+                    self._runs_root
+                    / "optimization"
+                    / spec.run_id
+                    / "events.jsonl"
+                ),
+                started_at=started_at,
+            )
+            record = self._record_payload(spec, handle)
+            self._consumed_tokens.add(token_hash)
+            self._confirmation_generation += 1
+            self._handle = handle
+            self._records[spec.run_id] = record
+            try:
+                self._write_record(record)
+                self._write_active_lock(spec.run_id)
+                thread = threading.Thread(
+                    target=self._run_job,
+                    args=(spec, handle),
+                    name=f"dspy-opt-{spec.run_id}",
+                    daemon=True,
+                )
+                handle._thread = thread
+                thread.start()
+            except JobBusyError:
+                handle.finish(
+                    JOB_STATUS_FAILED,
+                    error="another process holds the active-job lock",
+                )
+                self._complete_record(handle)
+                raise
+            except Exception as exc:  # noqa: BLE001 - worker start boundary
+                handle.finish(
+                    JOB_STATUS_FAILED,
+                    error=_redact_secret(
+                        f"worker start failed: {exc}",
+                        spec.settings.openrouter_api_key,
+                    ),
+                )
+                self._complete_record(handle)
+                self._release_active_lock(spec.run_id)
+                raise JobGateError(
+                    "the optimization worker could not start; no provider "
+                    "request was dispatched"
+                ) from exc
+            return handle
+
+    def request_cancel(self, run_id: str) -> bool:
+        with self._lock:
+            handle = self._handle
+        if handle is None or handle.run_id != run_id:
+            return False
+        return handle.request_cancel()
+
+    def recent_records(self, limit: int = 5) -> list[dict[str, object]]:
+        with self._lock:
+            records = [dict(record) for record in self._records.values()]
+        records.sort(
+            key=lambda record: str(
+                record.get("started_at") or record.get("created_at") or ""
+            ),
+            reverse=True,
+        )
+        return records[: max(1, limit)]
+
+    def _run_job(
+        self, spec: OptimizationJobSpec, handle: JobHandle
+    ) -> None:
+        try:
+            result = self._runner(spec, handle)
+        except Exception as exc:  # noqa: BLE001 - worker boundary
+            recovered = self._status_from_manifest(spec.run_id)
+            if recovered is None and handle.ledger.cancelled:
+                recovered = JOB_STATUS_STOPPED
+            handle.finish(
+                recovered or JOB_STATUS_FAILED,
+                error=_redact_secret(
+                    f"{type(exc).__name__}: {exc}",
+                    handle.settings.openrouter_api_key,
+                ),
+            )
+        else:
+            manifest = getattr(result, "manifest", None)
+            status = getattr(manifest, "status", JOB_STATUS_COMPLETED)
+            handle.finish(str(status), result=result)
+        finally:
+            try:
+                self._complete_record(handle)
+            finally:
+                self._release_active_lock(handle.run_id)
+
+    def _status_from_manifest(self, run_id: str) -> str | None:
+        run_dir = self._runs_root / "optimization" / run_id
+        try:
+            manifest = read_run_manifest(run_dir)
+        except Exception:  # noqa: BLE001 - missing manifest is not fatal here
+            return None
+        return manifest.status
+
+    def _record_payload(
+        self, spec: OptimizationJobSpec, handle: JobHandle
+    ) -> dict[str, object]:
+        limits = spec.settings.optimization_budget()
+        return {
+            "schema_version": JOB_SCHEMA_VERSION,
+            "run_id": spec.run_id,
+            "token_sha256": handle.token_sha256,
+            "mode": MODE_LIVE,
+            "status": handle.status,
+            "pid": os.getpid(),
+            "process_instance_id": PROCESS_INSTANCE_ID,
+            "process_start_token": _process_start_token(os.getpid()),
+            "created_at": handle.started_at,
+            "started_at": handle.started_at,
+            "finished_at": None,
+            "error": None,
+            "stop_reason": None,
+            "baseline_development_run_id": (
+                spec.baseline_development_run_id
+            ),
+            "max_calls": limits.max_calls,
+            "max_cost_usd": str(limits.max_cost_usd),
+        }
+
+    def _complete_record(self, handle: JobHandle) -> None:
+        with self._lock:
+            record = dict(self._records.get(handle.run_id, {}))
+            record.update(
+                {
+                    "status": handle.status,
+                    "finished_at": handle.finished_at,
+                    "error": handle.error,
+                    "stop_reason": handle.ledger.snapshot().stop_reason,
+                }
+            )
+            self._records[handle.run_id] = record
+            self._consumed_tokens.add(handle.token_sha256)
+            self._write_record(record)
+
+    def _run_exists(self, run_id: str) -> bool:
+        if run_id in self._records:
+            return True
+        return (self._runs_root / "optimization" / run_id).exists()
+
+    def _write_record(self, record: Mapping[str, object]) -> None:
+        atomic_write_json(
+            self._registry_dir / f"{record['run_id']}.json", record
+        )
+
+    def _write_active_lock(self, run_id: str) -> None:
+        payload = {
+            "schema_version": JOB_SCHEMA_VERSION,
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "process_instance_id": PROCESS_INSTANCE_ID,
+            "process_start_token": _process_start_token(os.getpid()),
+            "created_at": _utc_now(),
+        }
+        data = (
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
+        # The app is a single local process; this re-read narrows the
+        # stale-cleanup race. Cross-process exclusion is advisory
+        # defense-in-depth, backed by the job registry and run-ID checks.
+        for _attempt in (1, 2):
+            try:
+                descriptor = os.open(
+                    self._active_lock_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError as exc:
+                existing = _read_json_file(self._active_lock_path)
+                if existing is None:
+                    raise JobBusyError(
+                        "the active-job lock is unreadable; inspect it "
+                        "before starting another paid job"
+                    ) from exc
+                if _pid_alive(existing.get("pid")):
+                    raise JobBusyError(
+                        "another process holds the single active-job lock"
+                    ) from exc
+                current = _read_json_file(self._active_lock_path)
+                if current != existing:
+                    continue
+                try:
+                    self._active_lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as unlink_error:
+                    raise JobBusyError(
+                        "a stale active-job lock could not be cleared"
+                    ) from unlink_error
+                continue
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return
+        raise JobBusyError(
+            "another process holds the single active-job lock"
+        )
+
+    def _release_active_lock(self, run_id: str) -> None:
+        payload = _read_json_file(self._active_lock_path)
+        if payload is not None and payload.get("run_id") == run_id:
+            try:
+                self._active_lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _recover(self) -> None:
+        records: dict[str, dict[str, object]] = {}
+        for path in sorted(self._registry_dir.glob("*.json")):
+            payload = _read_json_file(path)
+            if payload is None:
+                continue
+            run_id = payload.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                continue
+            record = dict(payload)
+            records[run_id] = record
+            token_hash = record.get("token_sha256")
+            if isinstance(token_hash, str):
+                self._consumed_tokens.add(token_hash)
+            if record.get("status") != JOB_STATUS_RUNNING:
+                continue
+            pid = record.get("pid")
+            same_process_instance = (
+                pid == os.getpid()
+                and record.get("process_instance_id")
+                == PROCESS_INSTANCE_ID
+            )
+            if same_process_instance:
+                continue
+            if pid != os.getpid() and _pid_alive(pid):
+                recorded_start = record.get("process_start_token")
+                current_start = _process_start_token(pid)
+                if not (
+                    isinstance(recorded_start, str)
+                    and current_start is not None
+                    and recorded_start != current_start
+                ):
+                    continue
+            # Same PID with a different instance, or a reused PID with a
+            # different start token, is a restarted job with no live worker.
+            recovered_status = (
+                self._status_from_manifest(run_id)
+                or JOB_STATUS_INTERRUPTED
+            )
+            record["status"] = recovered_status
+            record["finished_at"] = _utc_now()
+            if recovered_status == JOB_STATUS_INTERRUPTED:
+                record["error"] = (
+                    "process restarted before the optimization job finished"
+                )
+                record["stop_reason"] = "interrupted"
+                self._append_interrupted_event(run_id)
+            self._records[run_id] = record
+            self._write_record(record)
+        self._records = records
+        lock_payload = _read_json_file(self._active_lock_path)
+        lock_stale_same_process = (
+            lock_payload is not None
+            and lock_payload.get("pid") == os.getpid()
+            and lock_payload.get("process_instance_id")
+            not in (None, PROCESS_INSTANCE_ID)
+        )
+        lock_process_reused = False
+        if lock_payload is not None:
+            recorded_start = lock_payload.get("process_start_token")
+            current_start = _process_start_token(lock_payload.get("pid"))
+            lock_process_reused = bool(
+                isinstance(recorded_start, str)
+                and current_start is not None
+                and recorded_start != current_start
+            )
+        if lock_payload is not None and (
+            not _pid_alive(lock_payload.get("pid"))
+            or lock_stale_same_process
+            or lock_process_reused
+        ):
+            try:
+                self._active_lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _append_interrupted_event(self, run_id: str) -> None:
+        run_dir = self._runs_root / "optimization" / run_id
+        if not run_dir.is_dir():
+            return
+        try:
+            append_jsonl(
+                run_dir / "events.jsonl",
+                {
+                    "at": _utc_now(),
+                    "event": "job_interrupted",
+                    "reason": "process_restart",
+                    "run_id": run_id,
+                },
+            )
+        except OSError:
+            pass
+
+
+def _run_optimization_job(
+    spec: OptimizationJobSpec, handle: JobHandle
+) -> object:
+    """Default worker body. Importing experiments stays off the Replay path."""
+    from dspy_lab.experiments import run_optimization
+
+    return run_optimization(
+        spec.settings,
+        spec.train_cases,
+        spec.validation_cases,
+        baseline_development_run_id=spec.baseline_development_run_id,
+        confirm_budget=True,
+        run_id=spec.run_id,
+        origin="live",
+        runs_root=spec.runs_root,
+        programs_root=spec.programs_root,
+        rules_text=spec.rules_text,
+        ledger=handle.ledger,
+    )
+
+
+_JOB_MANAGER_OVERRIDE: JobManager | None = None
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_job_manager() -> JobManager:
+    return JobManager(RUNS_ROOT, PROGRAMS_ROOT)
+
+
+def _get_job_manager() -> JobManager:
+    if _JOB_MANAGER_OVERRIDE is not None:
+        return _JOB_MANAGER_OVERRIDE
+    return _cached_job_manager()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="DSPy Prompt Optimization Lab",
@@ -151,11 +836,39 @@ def main() -> None:
     )
     st.title("DSPy Prompt Optimization Lab")
     st.caption(
-        "Read-only foundation: global Live/Replay selection, Overview, "
-        "Baseline, and Prompt Inspector."
+        "Replay-default presentation plus a single confirmation-gated Live "
+        "optimization job. Overview, Baseline, and Prompt Inspector remain "
+        "read-only."
     )
 
-    mode = _render_mode_selector()
+    active_lock = read_active_job_lock(RUNS_ROOT)
+    if (
+        active_lock is not None
+        and st.session_state.get("experiment_mode", MODE_REPLAY)
+        != MODE_LIVE
+    ):
+        st.session_state["experiment_mode"] = MODE_LIVE
+        st.session_state["_mode_switch_blocked"] = True
+        st.rerun()
+    mode = _render_mode_selector(disabled=active_lock is not None)
+    if st.session_state.pop("_mode_switch_blocked", False):
+        st.warning(
+            "A Live optimization job is active. Switching to Replay is "
+            "blocked until the job finishes or is cancelled."
+        )
+    job_manager: JobManager | None = None
+    previous_mode = st.session_state.get("_ui_previous_mode")
+    if mode == MODE_LIVE:
+        job_manager = _get_job_manager()
+    if previous_mode is not None and previous_mode != mode:
+        if job_manager is None:
+            job_manager = _get_job_manager()
+        job_manager.note_mode(mode)
+        _clear_confirmation_state()
+    elif job_manager is not None:
+        job_manager.note_mode(mode)
+    st.session_state["_ui_previous_mode"] = mode
+
     replay: ReplayContext | None = None
     live: LiveContext | None = None
     if mode == MODE_REPLAY:
@@ -188,20 +901,32 @@ def main() -> None:
         return
 
     assert live is not None
-    _render_live_screen(screen, live)
+    _render_live_screen(screen, live, job_manager)
 
 
-def _render_mode_selector() -> str:
+def _clear_confirmation_state() -> None:
+    for key in (
+        "opt_confirm_token",
+        "opt_confirm_run_id",
+        "opt_confirm_key",
+        "opt_confirm_epoch",
+        "opt_confirm_generation",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _render_mode_selector(*, disabled: bool = False) -> str:
     return st.radio(
         "Experiment mode",
         (MODE_REPLAY, MODE_LIVE),
         index=0,
         horizontal=True,
         key="experiment_mode",
+        disabled=disabled,
         help=(
             "Replay presents a completed recorded benchmark and never calls "
-            "a provider. Live inspects server-local runs; paid actions are "
-            "not part of this stage."
+            "a provider. Live adds one explicitly confirmed optimization job; "
+            "switching is blocked while that job is active."
         ),
     )
 
@@ -365,9 +1090,9 @@ def _render_replay_mode_status() -> None:
 
 def _render_live_mode_status(context: LiveContext) -> None:
     st.warning(
-        "Live Experiment — read-only in this stage. No paid action is "
-        "available on these screens, and no LM or provider request is "
-        "constructed."
+        "Live Experiment — one confirmation-gated optimization job is "
+        "available. Other paid actions are not part of this stage. No LM or "
+        "provider request is constructed until a job is started."
     )
     if context.settings is not None:
         st.caption(
@@ -447,11 +1172,407 @@ def _render_replay_screen(screen: str, archive: ReplayArchive) -> None:
         _render_inspector_screen(
             _inspector_view_from_replay(archive)
         )
+    elif screen == "Optimization":
+        _render_replay_optimization(archive)
     else:
         _render_planned_screen(screen, MODE_REPLAY)
 
 
-def _render_live_screen(screen: str, context: LiveContext) -> None:
+def _render_replay_optimization(archive: ReplayArchive) -> None:
+    st.subheader("Optimization")
+    st.caption(
+        "Replay Experiment: recorded optimization history only. This screen "
+        "cannot compile, resume, cancel, or start GEPA, and candidate "
+        "stepping makes no provider request."
+    )
+    optimization = archive.optimization
+    candidates, candidate_error = _candidate_records(
+        archive.candidate_stats
+    )
+    st.markdown(
+        f"- **Optimization run:** `{optimization.run_id}`\n"
+        f"- **Status / origin:** {optimization.status} / "
+        f"{optimization.origin}\n"
+        f"- **Created / finished (UTC):** {optimization.created_at} / "
+        f"{optimization.finished_at or 'not finished'}\n"
+        f"- **Baseline development run:** "
+        f"`{optimization.links.baseline_development_run_id}`\n"
+        f"- **Selected program:** "
+        f"`{optimization.links.optimized_program_id}`\n"
+        f"- **Recorded candidates:** {len(candidates)}"
+    )
+    if candidate_error:
+        st.warning(candidate_error)
+    for warning in optimization.warnings:
+        st.warning(warning)
+    if optimization.stop_reason is not None:
+        st.markdown(
+            f"- **Stop reason:** {optimization.stop_reason}"
+        )
+    st.info(
+        "Replay exposes no paid execution path. Candidate and reflection "
+        "inspection is read-only; start a fresh confirmed optimization in "
+        "Live to create a new job."
+    )
+
+
+def _render_optimization_screen(
+    context: LiveContext, manager: JobManager
+) -> None:
+    st.subheader("Optimization")
+    st.caption(
+        "Live Experiment: one confirmation-gated GEPA optimization job. The "
+        "worker uses a separate thread; this screen polls local events and "
+        "ledger counters without sending provider requests."
+    )
+    active = manager.active_handle
+    if active is not None:
+        _render_active_job_fragment(active)
+        return
+    latest = manager.latest_handle
+    if (
+        latest is not None
+        and st.session_state.get("opt_started_run_id") == latest.run_id
+    ):
+        _render_finished_job(latest)
+    _render_recent_jobs(manager)
+    if context.settings is None:
+        st.warning(
+            "A confirmed Live optimization requires a configured "
+            "OPENROUTER_API_KEY. No paid action is available."
+        )
+        return
+    if context.development is None:
+        st.info(
+            "A completed baseline development run is required before "
+            "optimization. This stage does not start baseline development "
+            "from the UI."
+        )
+        return
+    if context.development.manifest.status != "completed":
+        st.warning(
+            "The selected baseline development run is not completed. A paid "
+            "optimization requires a completed Live development run."
+        )
+        return
+    if context.development.manifest.origin != "live":
+        st.warning(
+            "The selected baseline development run is a mock/test record. "
+            "A paid Live optimization requires a completed Live development "
+            "run."
+        )
+        return
+    if read_active_job_lock(RUNS_ROOT) is not None:
+        st.warning(
+            "Another app process holds the single active-job lock. This "
+            "screen will not start a second optimization."
+        )
+        return
+    _render_optimization_confirmation(context, manager)
+
+
+def _render_recent_jobs(manager: JobManager) -> None:
+    records = manager.recent_records(5)
+    if not records:
+        return
+    with st.expander("Recent Live job records", expanded=False):
+        for record in records:
+            run_id = record.get("run_id", "unknown")
+            status = record.get("status", "unknown")
+            st.markdown(f"**`{run_id}` — {status}**")
+            st.text(
+                f"Started: {record.get('started_at') or 'unknown'}\n"
+                f"Finished: {record.get('finished_at') or 'still active'}\n"
+                f"Baseline development run: "
+                f"{record.get('baseline_development_run_id') or 'unknown'}\n"
+                f"Error: {record.get('error') or 'none'}"
+            )
+
+
+@st.fragment(run_every="1s")
+def _render_active_job_fragment(handle: JobHandle) -> None:
+    _render_job_details(handle)
+    if not handle.active:
+        st.rerun(scope="app")
+
+
+def _render_finished_job(handle: JobHandle) -> None:
+    _render_job_details(handle)
+
+
+def _render_job_details(handle: JobHandle) -> None:
+    snapshot = handle.budget_snapshot()
+    status = handle.status
+    st.markdown(f"### Job `{handle.run_id}` — {status}")
+    st.markdown(
+        f"- **Admitted calls:** {snapshot.admitted_calls} / "
+        f"{snapshot.max_calls}\n"
+        f"- **Remaining calls:** {snapshot.remaining_calls}\n"
+        f"- **Delegated / succeeded / failed:** "
+        f"{snapshot.delegated_calls} / {snapshot.succeeded_calls} / "
+        f"{snapshot.failed_calls}\n"
+        f"- **Cost status:** {_job_cost_status(snapshot)}\n"
+        f"- **Estimated cost:** {snapshot.estimated_cost_usd} USD\n"
+        f"- **Actual cost:** {snapshot.actual_cost_usd} USD\n"
+        f"- **Unresolved reservation:** "
+        f"{snapshot.unresolved_cost_usd} USD\n"
+        f"- **Total known cost:** {snapshot.total_cost_usd} USD"
+    )
+    if snapshot.stop_reason is not None:
+        st.markdown(f"- **Stop reason:** {snapshot.stop_reason}")
+    events = handle.read_events(limit=25)
+    if events:
+        with st.expander("Persisted progress events", expanded=False):
+            for event in events:
+                st.text(_job_event_line(event))
+    else:
+        st.caption(
+            "Waiting for the first persisted progress event. Polling reads "
+            "local files only."
+        )
+    if handle.status == JOB_STATUS_RUNNING:
+        st.warning(
+            "Cancellation is cooperative before the next dispatch. An "
+            "already-sent request can still finish and incur its reserved "
+            "charge; cancellation never reverses charges already incurred."
+        )
+        if st.button(
+            "Cancel optimization",
+            key=f"cancel-optimization-{handle.run_id}",
+        ):
+            if handle.request_cancel():
+                st.warning(
+                    "Cancellation requested. Waiting for any in-flight "
+                    "request to finish before the job can stop."
+                )
+            else:
+                st.info("The job is no longer running.")
+    elif handle.status == JOB_STATUS_CANCELLING:
+        st.info(
+            "Cancellation is in progress. Waiting for any in-flight request "
+            "to finish; already incurred charges are not reversed."
+        )
+    else:
+        _render_job_result(handle)
+
+
+def _render_job_result(handle: JobHandle) -> None:
+    result = handle.result
+    manifest = getattr(result, "manifest", None)
+    selected = getattr(result, "selected_program", None)
+    warnings = getattr(result, "warnings", ())
+    snapshot = handle.budget_snapshot()
+    if manifest is not None:
+        st.markdown(
+            f"- **Recorded run ID:** `{manifest.run_id}`\n"
+            f"- **Recorded status:** {manifest.status}\n"
+            f"- **Recorded origin:** {manifest.origin}"
+        )
+    if selected is not None:
+        st.markdown(
+            f"- **Selected program ID:** `{selected.program_id}`"
+        )
+    for warning in warnings:
+        st.warning(str(warning))
+    if handle.status == JOB_STATUS_STOPPED and snapshot.stop_reason == "cancelled":
+        st.warning(
+            "Optimization stopped after cancellation. Charges already "
+            "incurred are not reversed; a new run requires fresh "
+            "confirmation and a new budget review."
+        )
+    elif handle.status == JOB_STATUS_INTERRUPTED:
+        st.error(
+            "This job was interrupted by a process restart. It was not "
+            "resumed; start a fresh confirmed run if needed."
+        )
+    elif handle.status == JOB_STATUS_FAILED:
+        st.error(
+            f"Optimization failed: {handle.error or 'unknown worker error'}"
+        )
+    elif handle.status == JOB_STATUS_COMPLETED:
+        st.success("Optimization completed with the recorded status above.")
+
+
+def _job_event_line(event: Mapping[str, object]) -> str:
+    parts = [
+        str(event.get("at", "")),
+        str(event.get("event", "event")),
+    ]
+    for key in (
+        "status",
+        "case_id",
+        "candidate_index",
+        "program_id",
+        "stop_reason",
+        "admitted_calls",
+        "train_cases",
+        "validation_cases",
+    ):
+        if key in event:
+            parts.append(f"{key}={event[key]}")
+    return " · ".join(part for part in parts if part)
+
+
+def _job_cost_status(snapshot: BudgetSnapshot) -> str:
+    if snapshot.pending_cost_calls or snapshot.unresolved_cost_usd > 0:
+        return "pending"
+    if snapshot.actual_cost_usd > 0:
+        return "actual"
+    if snapshot.estimated_cost_usd > 0:
+        return "estimated"
+    if snapshot.committed_cost_usd > 0:
+        return "committed"
+    return "none"
+
+
+def _render_optimization_confirmation(
+    context: LiveContext, manager: JobManager
+) -> None:
+    settings = context.settings
+    development = context.development
+    assert settings is not None
+    assert development is not None
+    try:
+        split = load_optimization_cases(
+            DATA_DIR / "train.jsonl",
+            DATA_DIR / "validation.jsonl",
+        )
+    except Exception as exc:  # noqa: BLE001 - explicit UI gap
+        st.error(f"Optimization inputs are unavailable: {exc}")
+        return
+    train = tuple(split["train"])
+    validation = tuple(development.cases)
+    task_route = settings.task_route()
+    reflection_route = settings.reflection_route()
+    limits = settings.optimization_budget()
+    headroom = (
+        settings.max_optimization_calls
+        - settings.max_optimization_metric_calls
+    )
+    config_key = "|".join(
+        [
+            str(manager.mode_epoch),
+            str(manager.confirmation_generation),
+            development.manifest.run_id,
+            settings.task_model,
+            settings.task_provider,
+            settings.reflection_model,
+            settings.reflection_provider,
+            str(settings.max_optimization_calls),
+            str(settings.max_optimization_cost_usd),
+            str(settings.max_optimization_metric_calls),
+            str(settings.temperature),
+            str(settings.max_output_tokens),
+            str(settings.reflection_temperature),
+            str(settings.reflection_max_output_tokens),
+            str(settings.request_timeout_seconds),
+            str(len(train)),
+            str(len(validation)),
+        ]
+    )
+    if (
+        st.session_state.get("opt_confirm_key") != config_key
+        or not st.session_state.get("opt_confirm_token")
+        or not st.session_state.get("opt_confirm_run_id")
+        or st.session_state.get("opt_confirm_epoch")
+        != manager.mode_epoch
+        or st.session_state.get("opt_confirm_generation")
+        != manager.confirmation_generation
+    ):
+        _clear_confirmation_state()
+        st.session_state["opt_confirm_key"] = config_key
+        st.session_state["opt_confirm_token"] = secrets.token_hex(16)
+        st.session_state["opt_confirm_run_id"] = _new_job_run_id()
+        st.session_state["opt_confirm_epoch"] = manager.mode_epoch
+        st.session_state["opt_confirm_generation"] = (
+            manager.confirmation_generation
+        )
+    token = str(st.session_state["opt_confirm_token"])
+    run_id = str(st.session_state["opt_confirm_run_id"])
+    epoch = int(st.session_state["opt_confirm_epoch"])
+    generation = int(st.session_state["opt_confirm_generation"])
+
+    st.markdown(
+        f"- **Baseline development run:** `{development.manifest.run_id}`\n"
+        f"- **Train + validation cases:** {len(train)} + "
+        f"{len(validation)} (validation is the development snapshot)\n"
+        f"- **Sealed test split:** not read by optimization\n"
+        f"- **Task model/provider:** `{task_route.model}` / "
+        f"`{task_route.provider}` at "
+        f"{task_route.input_usd_per_million}/"
+        f"{task_route.output_usd_per_million} USD per 1M tokens; "
+        f"temperature {settings.temperature}, output cap "
+        f"{settings.max_output_tokens}\n"
+        f"- **Reflection model/provider:** `{reflection_route.model}` / "
+        f"`{reflection_route.provider}` at "
+        f"{reflection_route.input_usd_per_million}/"
+        f"{reflection_route.output_usd_per_million} USD per 1M tokens; "
+        f"temperature {settings.reflection_temperature}, output cap "
+        f"{settings.reflection_max_output_tokens}\n"
+        f"- **Request timeout:** {settings.request_timeout_seconds} s\n"
+        f"- **Confirmed optimization budget:** {limits.max_calls} calls / "
+        f"{limits.max_cost_usd} USD\n"
+        f"- **GEPA metric-call target:** "
+        f"{settings.max_optimization_metric_calls} "
+        f"({headroom} call headroom)\n"
+        f"- **Fresh job run ID:** `{run_id}`"
+    )
+    confirmed = st.checkbox(
+        "I confirm this optimization budget and authorize real provider "
+        "requests. I understand cancellation cannot reverse charges "
+        "already incurred.",
+        key=f"opt_confirm_checkbox_{token}",
+    )
+    with st.form("optimization_confirmation_form", clear_on_submit=False):
+        st.markdown("#### Confirm the paid Live optimization")
+        st.markdown(
+            "This is the only S13 action that can make paid provider calls. "
+            "It starts from the selected completed development run and the "
+            "frozen train/validation inputs. No test case is loaded."
+        )
+        submitted = st.form_submit_button("Start confirmed optimization")
+    if not submitted:
+        return
+    if not confirmed:
+        st.error(
+            "Explicit budget confirmation is required; no request was made."
+        )
+        return
+    spec = OptimizationJobSpec(
+        mode=MODE_LIVE,
+        run_id=run_id,
+        token=token,
+        mode_epoch=epoch,
+        confirmation_generation=generation,
+        settings=settings,
+        baseline_development_run_id=development.manifest.run_id,
+        train_cases=train,
+        validation_cases=validation,
+        rules_text=development.rules_text,
+        runs_root=RUNS_ROOT,
+        programs_root=PROGRAMS_ROOT,
+    )
+    try:
+        handle = manager.start_job(spec)
+    except JobGateError as exc:
+        _clear_confirmation_state()
+        st.error(f"Optimization was not started: {exc}")
+        active = manager.active_handle
+        if active is not None:
+            _render_job_details(active)
+        return
+    st.session_state["opt_started_run_id"] = handle.run_id
+    _clear_confirmation_state()
+    st.success(
+        "Optimization started. Progress polls local events and the shared "
+        "per-job ledger; no additional provider request is made by polling."
+    )
+    _render_job_details(handle)
+
+
+def _render_live_screen(
+    screen: str, context: LiveContext, manager: JobManager | None
+) -> None:
     if (
         context.development is not None
         and context.development.manifest.origin == "mock_test"
@@ -497,6 +1618,10 @@ def _render_live_screen(screen: str, context: LiveContext) -> None:
                 )
             return
         _render_inspector_screen(_inspector_view_from_live(context))
+    elif screen == "Optimization":
+        _render_optimization_screen(
+            context, manager or _get_job_manager()
+        )
     else:
         _render_planned_screen(screen, MODE_LIVE)
 
@@ -504,9 +1629,9 @@ def _render_live_screen(screen: str, context: LiveContext) -> None:
 def _render_planned_screen(screen: str, mode: str) -> None:
     st.subheader(screen)
     st.info(
-        f"{screen} is implemented in a later stage. This stage provides the "
-        "global mode selector and the read-only Overview, Baseline, and "
-        "Prompt Inspector screens."
+        f"{screen} is implemented in a later stage. This stage provides "
+        "Overview, Baseline, Optimization, and Prompt Inspector; "
+        "Comparison and Playground remain planned."
     )
     if mode == MODE_REPLAY:
         st.caption(
@@ -621,7 +1746,7 @@ def _render_live_overview(context: LiveContext) -> None:
     latest_development = _latest_run_label(context.development_entries)
     latest_optimization = _latest_run_label(context.optimization_entries)
     st.markdown(
-        f"- **Mode:** Live Experiment (read-only stage)\n"
+        f"- **Mode:** Live Experiment (one confirmation-gated optimization job)\n"
         f"- **Active baseline program:** `{active_program}`\n"
         f"- **Task model:** `{task_model}`\n"
         f"- **Task provider:** `{task_provider}`\n"

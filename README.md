@@ -33,10 +33,12 @@ sealed test snapshots, deterministic per-case A/B and B/A ordering, exact
 per-arm predictions/errors/metrics, micro-versus-mean metrics, cost and
 latency summaries, cost-only break-even economics, validity/completeness
 gates, and test-reuse exposure history. S12 adds the global Live/Replay
-selector and the read-only Overview, Baseline, and Prompt Inspector screens;
-Replay is the default, and the Live foundation only inspects server-local
-records without starting paid work. The remaining screens and job lifecycle are
-implemented in later stages. No paid API call has been made.
+selector and the read-only Overview, Baseline, and Prompt Inspector screens.
+S13 adds one confirmation-gated Live optimization job backed by a single local
+worker thread, durable progress events, cooperative cancellation, a server-side
+single-job lock, and restart-interruption records. Replay remains the default
+and exposes no paid execution path. Comparison and Playground remain for later
+stages. No paid API call has been made.
 
 ## Requirements
 
@@ -71,8 +73,9 @@ uv run streamlit run app.py --server.address 127.0.0.1
 
 The app opens in Replay Experiment mode without an API key. Replay reads only
 recorded local artifacts, makes no provider/catalog/billing request, and shows
-zero additional API calls or cost. Switch to Live Experiment only to inspect
-server-local recorded runs; S12 exposes no paid action.
+zero additional API calls or cost. Live Experiment adds exactly one explicit,
+checkbox-confirmed optimization action with its own budget; it starts no work
+until the confirmation form is submitted. Replay exposes no paid action.
 
 ## Configuration
 
@@ -446,16 +449,17 @@ reevaluation, Replay compatibility, and test-reuse exposure history.
 
 ## Scope and limitations
 
-S1-S12 complete the 50-case dataset, seal the held-out test split, provide
+S1-S13 complete the 50-case dataset, seal the held-out test split, provide
 deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
 with a strict adapter, add the strict-budget guarded LM/ledger, implement the
 explicitly authorized provider preflight with local records, add safe
 program/run persistence with a read-only Replay reader, implement the
 separately confirmed baseline validation, genuine GEPA compile, and paired
 benchmark paths, and add the Replay-default UI foundation with Overview,
-Baseline, and Prompt Inspector. S12's Live branch is read-only and never starts
-paid work. Optimization job lifecycle, Comparison/Playground, and release
-validation remain in `dspy_plan.md` sections 13-15. No live preflight,
+Baseline, and Prompt Inspector. S13 adds the single confirmed Live optimization
+job with progress polling and cooperative cancellation; Replay never starts or
+resumes GEPA. Comparison/Playground and release validation remain in
+`dspy_plan.md` sections 14-15. No live preflight,
 optimization, benchmark, or released archive exists, and no paid API call has
 been made. The host
 Python 3.15.0 installation is untouched; only this project's isolated
