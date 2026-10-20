@@ -1079,10 +1079,36 @@ def test_build_guarded_lm_pins_route_and_does_not_dispatch() -> None:
     assert reflection.max_output_tokens == (
         settings.reflection_max_output_tokens
     )
-    assert reflection.kwargs["temperature"] == settings.reflection_temperature
+    assert "temperature" not in reflection.kwargs
     assert task.supports_response_schema is True
     assert reflection.supports_response_schema is True
     assert len(ledger.records) == 0
+
+
+def test_build_guarded_lm_omits_temperature_only_when_route_lacks_it() -> None:
+    settings = load_settings(
+        mode="live", env={"OPENROUTER_API_KEY": SECRET}
+    )
+    ledger = make_ledger()
+    reflection = build_guarded_lm(
+        settings, role="reflection", ledger=ledger
+    )
+    assert "temperature" not in reflection.kwargs
+
+    cheap_settings = load_settings(
+        mode="live",
+        env={
+            "OPENROUTER_API_KEY": SECRET,
+            "REFLECTION_MODEL": MODEL_BARE,
+            "REFLECTION_PROVIDER": PROVIDER,
+        },
+    )
+    cheap_reflection = build_guarded_lm(
+        cheap_settings, role="reflection", ledger=ledger
+    )
+    assert cheap_reflection.kwargs["temperature"] == (
+        cheap_settings.reflection_temperature
+    )
 
 
 def test_build_guarded_lm_requires_live_mode() -> None:

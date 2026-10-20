@@ -138,6 +138,7 @@ class ProviderRouteProfile:
     output_usd_per_million: Decimal
     cache_write_usd_per_million: Decimal = Decimal("0")
     expected_schema_mode: ProviderSchemaMode = "native"
+    supports_temperature: bool = True
 
     def __post_init__(self) -> None:
         if self.role not in ("task", "reflection"):
@@ -185,6 +186,10 @@ class ProviderRouteProfile:
             raise InvalidConfigurationError(
                 "provider route expected_schema_mode must be native or "
                 "json_object"
+            )
+        if not isinstance(self.supports_temperature, bool):
+            raise InvalidConfigurationError(
+                "provider route supports_temperature must be a boolean"
             )
 
 
@@ -367,6 +372,7 @@ PROVIDER_ROUTE_PROFILES: tuple[ProviderRouteProfile, ...] = (
         output_usd_per_million=Decimal("15.00"),
         cache_write_usd_per_million=Decimal("5.00"),
         expected_schema_mode="native",
+        supports_temperature=False,
     ),
     ProviderRouteProfile(
         role="reflection",

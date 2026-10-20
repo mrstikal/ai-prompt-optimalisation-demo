@@ -84,7 +84,17 @@ def catalog_payload(
         "quantization": "test",
         "supports_implicit_caching": False,
         "supported_parameters": (
-            ["structured_outputs", "response_format", "reasoning", "max_tokens"]
+            [
+                "structured_outputs",
+                "response_format",
+                "reasoning",
+                "max_tokens",
+                *(
+                    ["temperature"]
+                    if profile.supports_temperature
+                    else []
+                ),
+            ]
             if supported_parameters is None
             else supported_parameters
         ),
@@ -234,7 +244,10 @@ def test_catalog_parser_uses_maximum_override_price() -> None:
         (lambda profile, payload: payload["data"]["endpoints"][0].update({"tag": "other/provider"}), "exactly one endpoint"),
         (lambda profile, payload: payload["data"]["endpoints"][0].update({"context_length": 10}), "context"),
         (lambda profile, payload: payload["data"]["endpoints"][0].update({"max_completion_tokens": 1}), "max_completion_tokens"),
-        (lambda profile, payload: payload["data"]["endpoints"][0].update({"supported_parameters": ["response_format"]}), "structured_outputs"),
+        (lambda profile, payload: payload["data"]["endpoints"][0].update({"supported_parameters": ["response_format", "temperature"]}), "structured_outputs"),
+        (lambda profile, payload: payload["data"]["endpoints"][0].update({"supported_parameters": ["response_format", "structured_outputs"]}), "temperature"),
+        (lambda profile, payload: payload["data"]["endpoints"][0].update({"supported_parameters": ["response_format", "structured_outputs", "temperature"]}), "max_tokens"),
+        (lambda profile, payload: payload["data"]["endpoints"][0].update({"supported_parameters": ["response_format", "structured_outputs", "temperature", "max_tokens"]}), "reasoning"),
         (lambda profile, payload: payload["data"]["endpoints"][0].update({"service_tier": "flex"}), "service tier"),
         (lambda profile, payload: payload["data"]["endpoints"][0]["pricing"].update({"prompt": "9"}), "exceeds"),
         (lambda profile, payload: payload["data"]["endpoints"][0]["pricing"].update({"completion": "9"}), "exceeds"),
@@ -395,6 +408,11 @@ def test_preflight_passes_with_exactly_two_task_and_one_reflection_call(
         reflection_records[0]["request_kwargs"]["max_tokens"]
         == PREFLIGHT_REFLECTION_MAX_TOKENS
     )
+    assert all(
+        record["request_kwargs"]["temperature"] == settings.temperature
+        for record in task_records
+    )
+    assert "temperature" not in reflection_records[0]["request_kwargs"]
     assert all(
         record["request_kwargs"]["extra_body"]["provider"]["only"]
         == [record["provider"]]

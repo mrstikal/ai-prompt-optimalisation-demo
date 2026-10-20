@@ -268,6 +268,8 @@ def test_default_provider_routes_are_frozen() -> None:
     assert reflection.input_usd_per_million == Decimal("4.00")
     assert reflection.output_usd_per_million == Decimal("15.00")
     assert reflection.cache_write_usd_per_million == Decimal("5.00")
+    assert task.supports_temperature is True
+    assert reflection.supports_temperature is False
 
 
 def test_cheap_reflection_route_is_predeclared() -> None:
@@ -285,6 +287,7 @@ def test_cheap_reflection_route_is_predeclared() -> None:
     assert reflection.endpoint_max_output_tokens == 131_072
     assert reflection.input_usd_per_million == Decimal("0.098")
     assert reflection.output_usd_per_million == Decimal("0.294")
+    assert reflection.supports_temperature is True
 
 
 def test_same_cheap_model_can_serve_both_roles() -> None:

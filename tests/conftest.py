@@ -23,6 +23,13 @@ def _catalog_payload(profile, output_cap: int) -> dict[str, object]:
                     "supported_parameters": [
                         "response_format",
                         "structured_outputs",
+                        "max_tokens",
+                        "reasoning",
+                        *(
+                            ["temperature"]
+                            if profile.supports_temperature
+                            else []
+                        ),
                     ],
                     "pricing": {
                         "prompt": str(

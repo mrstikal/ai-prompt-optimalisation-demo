@@ -184,8 +184,9 @@ default task route is DeepSeek V4.1 Flash
 (`deepseek/deepseek-v4.1-flash-1017`, provider `deepinfra/fp8`). The default
 reflection route is GPT-6 Sol (`openai/gpt-6-sol`, provider `openai`). A
 supported lower-cost alternative uses the same DeepSeek route for reflection.
-Neither choice guarantees better results; quality and economics must be read
-from the experiment.
+GPT-6 Sol does not accept a temperature parameter, so reflection temperature
+is sent only on routes that advertise it. Neither choice guarantees better
+results; quality and economics must be read from the experiment.
 
 ### OpenRouter and LiteLLM: access and visibility
 
@@ -358,7 +359,7 @@ costs are not treated as free, and cancellation cannot refund sent requests.
 | `TASK_MODEL`, `TASK_PROVIDER` | DeepSeek route listed above; used for both comparison arms. |
 | `REFLECTION_MODEL`, `REFLECTION_PROVIDER` | GPT-6 Sol route listed above; used during optimization. |
 | `TEMPERATURE`, `MAX_OUTPUT_TOKENS` | `0.0`, `2048` for article review. |
-| `REFLECTION_TEMPERATURE`, `REFLECTION_MAX_OUTPUT_TOKENS` | `1.0`, `4096` for prompt proposals. |
+| `REFLECTION_TEMPERATURE`, `REFLECTION_MAX_OUTPUT_TOKENS` | `1.0`, `4096` for prompt proposals; temperature is omitted on the default GPT-6 Sol route because the endpoint does not advertise it. |
 | `MAX_OPTIMIZATION_METRIC_CALLS` | `120`; GEPA's evaluation target, distinct from the total 160-call budget. Keep the default 40-call headroom for the first run. |
 | `REQUEST_TIMEOUT_SECONDS` | `120` per request. |
 

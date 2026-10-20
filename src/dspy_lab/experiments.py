@@ -1006,7 +1006,12 @@ def _config_payload(
         payload["reflection"] = {
             "model": reflection_route.model,
             "provider": reflection_route.provider,
-            "temperature": settings.reflection_temperature,
+            "temperature": (
+                settings.reflection_temperature
+                if reflection_route.supports_temperature
+                else None
+            ),
+            "supports_temperature": reflection_route.supports_temperature,
             "max_output_tokens": settings.reflection_max_output_tokens,
             "schema_mode": reflection_route.expected_schema_mode,
         }

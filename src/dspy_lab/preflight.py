@@ -237,6 +237,13 @@ def parse_endpoint_catalog(
         raise PreflightError(
             "catalog endpoint does not advertise response_format"
         )
+    if profile.supports_temperature and (
+        "temperature" not in supported_parameters
+    ):
+        raise PreflightError(
+            "catalog endpoint does not advertise temperature required by "
+            f"the {profile.role} route"
+        )
     if profile.expected_schema_mode == "native" and (
         "structured_outputs" not in supported_parameters
     ):
@@ -244,6 +251,12 @@ def parse_endpoint_catalog(
             "catalog endpoint does not advertise structured_outputs for "
             "native schema mode"
         )
+    for required_parameter in ("max_tokens", "reasoning"):
+        if required_parameter not in supported_parameters:
+            raise PreflightError(
+                "catalog endpoint does not advertise "
+                f"{required_parameter} required by the frozen request contract"
+            )
     pricing = endpoint.get("pricing")
     if not isinstance(pricing, Mapping):
         raise PreflightError("catalog endpoint pricing is missing")
@@ -542,6 +555,7 @@ def run_preflight(
                     phase="task",
                     route=task_route,
                     max_tokens=task_route.max_output_tokens,
+                    expected_temperature=settings.temperature,
                 ):
                     add_check(f"{case.case_id}.{name}", passed, detail)
                 findings = prediction.findings
@@ -603,6 +617,11 @@ def run_preflight(
             phase="reflection",
             route=reflection_route,
             max_tokens=PREFLIGHT_REFLECTION_MAX_TOKENS,
+            expected_temperature=(
+                settings.reflection_temperature
+                if reflection_route.supports_temperature
+                else None
+            ),
         ):
             add_check(f"reflection.{name}", passed, detail)
         instruction = reflection_prediction.instruction
@@ -754,6 +773,7 @@ def _request_checks(
     phase: str,
     route: ModelRoute,
     max_tokens: int,
+    expected_temperature: float | None,
 ) -> list[tuple[str, bool, str]]:
     checks: list[tuple[str, bool, str]] = []
 
@@ -775,6 +795,14 @@ def _request_checks(
         "max_tokens",
         record.request_kwargs.get("max_tokens") == max_tokens,
         record.request_kwargs.get("max_tokens"),
+    )
+    actual_temperature = record.request_kwargs.get("temperature")
+    add(
+        "temperature",
+        actual_temperature == expected_temperature,
+        actual_temperature
+        if expected_temperature is not None
+        else "omitted (route does not support temperature)",
     )
     add(
         "schema_mode",
@@ -942,6 +970,7 @@ def _profile_dict(profile: ProviderRouteProfile) -> dict[str, object]:
             profile.cache_write_usd_per_million
         ),
         "expected_schema_mode": profile.expected_schema_mode,
+        "supports_temperature": profile.supports_temperature,
     }
 
 

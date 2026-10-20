@@ -517,6 +517,7 @@ class ModelRoute:
     max_output_tokens: int
     pricing: ModelPricing
     expected_schema_mode: SchemaMode = "native"
+    supports_temperature: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model", validate_model_id(self.model))
@@ -556,6 +557,10 @@ class ModelRoute:
         ):
             raise BudgetConfigurationError(
                 "expected_schema_mode must be native, json_object, or none"
+            )
+        if not isinstance(self.supports_temperature, bool):
+            raise BudgetConfigurationError(
+                "supports_temperature must be a boolean"
             )
 
 
@@ -1289,6 +1294,8 @@ class GuardedLM(dspy.LM):
             engine="litellm",
             **kwargs,
         )
+        if temperature is None:
+            self.kwargs.pop("temperature", None)
         self._ledger = ledger
         self._pricing = pricing
         self._context_limit = context_limit
@@ -1722,6 +1729,7 @@ def model_route_for(settings: Settings, *, role: ProviderRole) -> ModelRoute:
             cache_write_usd_per_million=profile.cache_write_usd_per_million,
         ),
         expected_schema_mode=profile.expected_schema_mode,
+        supports_temperature=profile.supports_temperature,
     )
 
 
@@ -1749,6 +1757,8 @@ def build_guarded_lm(
         if role == "task"
         else settings.reflection_temperature
     )
+    if not route.supports_temperature:
+        temperature = None
     return GuardedLM.from_route(
         route,
         ledger=ledger,

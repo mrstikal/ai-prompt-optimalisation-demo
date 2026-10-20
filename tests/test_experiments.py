@@ -683,6 +683,9 @@ def test_optimization_runs_genuine_gepa_and_round_trips_selected_program(
     )
     assert SECRET not in config_text
     assert "gold_findings" not in config_text
+    config = json.loads(config_text)
+    assert config["reflection"]["temperature"] is None
+    assert config["reflection"]["supports_temperature"] is False
 
 
 def test_optimization_labels_a_perfect_baseline_as_unexercised(
