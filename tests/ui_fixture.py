@@ -25,8 +25,9 @@ from dspy_lab.artifacts import (
     write_input_snapshot,
     write_run_manifest,
 )
-from dspy_lab.config import collect_runtime_versions
+from dspy_lab.config import Settings, collect_runtime_versions
 from dspy_lab.data import load_cases
+from dspy_lab.experiments import _task_config_payload
 from dspy_lab.metrics import (
     InvalidPrediction,
     aggregate_scores,
@@ -535,6 +536,12 @@ def build_ui_archive(
             "run_id": "opt-ui",
             "phase": "optimization",
             "created_at": UTC,
+            "task": _task_config_payload(
+                Settings(
+                    mode="live",
+                    openrouter_api_key="sk-or-v1-fixture",
+                )
+            ),
         },
     )
     atomic_write_jsonl(

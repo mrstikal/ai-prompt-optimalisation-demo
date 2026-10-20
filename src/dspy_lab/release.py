@@ -41,22 +41,27 @@ from .config import (
     load_settings,
 )
 from .data import (
+    DatasetValidationError,
     canonical_document_sha256,
+    dataset_sha256,
     load_cases,
+    load_review_audit,
     load_split_manifest,
+    validate_review_audit,
 )
 from .experiments import (
+    ArmMeasurement,
     ExperimentError,
+    PairedMeasurement,
     run_baseline_development,
+    summarize_benchmark,
 )
-from .metrics import (
-    CaseScore,
-    CorpusScore,
-    InvalidPrediction,
-    aggregate_scores,
-    score_case,
+from .metrics import CaseScore, CorpusScore, aggregate_scores
+from .recorded_scoring import (
+    RecordedOutcomeScoringError,
+    rescore_recorded_outcome,
 )
-from .schemas import ALLOWED_CODES, CaseRecord, EditorialQAOutput
+from .schemas import ALLOWED_CODES, CaseRecord
 
 DATA_DIR = PROJECT_ROOT / "data/v1"
 RELEASE_REPORT_SCHEMA_VERSION = "release_validation_v1"
@@ -253,23 +258,12 @@ def _close(left: object, right: object) -> bool:
 
 
 def _rescore(case: CaseRecord, outcome) -> CaseScore:
-    if outcome.status == "ok" and outcome.findings is not None:
-        return score_case(
-            case, EditorialQAOutput(findings=list(outcome.findings))
+    try:
+        return rescore_recorded_outcome(
+            case, outcome, strict_error_kind=True
         )
-    metric = outcome.metric if isinstance(outcome.metric, Mapping) else {}
-    kind = metric.get("error_kind")
-    if kind not in ("parse_error", "request_error", "missing_output"):
-        raise ReleaseValidationError(
-            f"invalid archived outcome {outcome.phase}/{outcome.case_id} "
-            "has no recognized error_kind"
-        )
-    reason = (
-        outcome.error
-        or metric.get("error")
-        or "recorded invalid output"
-    )
-    return score_case(case, InvalidPrediction(str(reason), kind=kind))
+    except RecordedOutcomeScoringError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
 
 
 def _corpus_for_arm(
@@ -430,11 +424,278 @@ def _dataset_contract(
         failures.append("split manifest does not mark the test split sealed")
     if manifest.get("total_article_count") != 50:
         failures.append("split manifest total_article_count is not 50")
-    notes.append(
-        "dataset manifest hash: "
-        + str(manifest.get("combined_dataset_sha256", "unavailable"))
-    )
+    recorded_dataset_hash = manifest.get("combined_dataset_sha256")
+    try:
+        recomputed_dataset_hash = dataset_sha256(
+            [
+                *load_cases(data_dir / "train.jsonl"),
+                *load_cases(data_dir / "validation.jsonl"),
+                *archive.cases,
+            ]
+        )
+    except Exception as exc:  # noqa: BLE001 - report, do not infer
+        failures.append(f"cannot recompute the combined dataset hash: {exc}")
+    else:
+        if recorded_dataset_hash != recomputed_dataset_hash:
+            failures.append(
+                "combined_dataset_sha256 does not match the current "
+                "train/validation files plus the archived test snapshot"
+            )
+        notes.append(f"dataset manifest hash: {recorded_dataset_hash}")
     return failures, notes
+
+
+def _gold_approval_check(
+    archive: ReplayArchive, data_dir: Path
+) -> tuple[list[str], list[str], bool]:
+    """Validate archived approvals, reviewer independence, and human sign-off.
+
+    Returns failures, notes, and whether every case has a human approval. A
+    fully automated pre-review does not satisfy the human sign-off gate.
+    """
+    try:
+        entries = load_review_audit(data_dir / "reviews.jsonl")
+        current_cases = [
+            *load_cases(data_dir / "train.jsonl"),
+            *load_cases(data_dir / "validation.jsonl"),
+            *archive.cases,
+        ]
+        validate_review_audit(
+            current_cases, entries, require_approved_review=True
+        )
+    except (OSError, DatasetValidationError, ValueError) as exc:
+        return [f"gold review audit is invalid: {exc}"], [], False
+    problems: list[str] = []
+    for entry in entries:
+        if entry.author_id == entry.reviewer_id:
+            problems.append(
+                f"{entry.case_id}: reviewer is not independent of the author"
+            )
+    expected = {case.case_id for case in current_cases}
+    entries_by_id = {entry.case_id: entry for entry in entries}
+    human_approved = {
+        entry.case_id
+        for entry in entries
+        if entry.reviewer_kind == "human"
+        and entry.reviewer_decision == "approved"
+        and entry.author_decision == "approved"
+        and entry.reconciled
+    }
+    missing_human = sorted(expected - human_approved)
+    notes = [
+        f"{len(human_approved)} of {len(expected)} cases have an independent "
+        "approved human sign-off."
+    ]
+    if missing_human:
+        notes.append(
+            "Human sign-off is still required for: "
+            + ", ".join(missing_human)
+        )
+    if set(entries_by_id) != expected:
+        problems.append(
+            "reviews.jsonl does not contain exactly one approval per case"
+        )
+    return problems, notes, not missing_human and not problems
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        result = Decimal(str(value))
+    except (ValueError, ArithmeticError):
+        return None
+    return result if result.is_finite() else None
+
+
+def _records_cost(
+    records: Sequence[object],
+) -> tuple[Decimal, str]:
+    """Reconstruct the ledger total bound and cost status from requests.
+
+    Estimated/reconciled accounting retains conservative reservations until a
+    charge is verified, so the bound is max(reservation, estimate) for every
+    outstanding record and the actual cost for reconciled records.
+    """
+    total = Decimal("0")
+    statuses: set[str] = set()
+    for record in records:
+        cost_status = str(getattr(record, "cost_status", "unavailable"))
+        statuses.add(cost_status)
+        status = str(getattr(record, "status", ""))
+        if status == "released":
+            continue
+        if status == "reconciled":
+            actual = getattr(record, "reported_cost_usd", None)
+            if isinstance(actual, Decimal) and actual.is_finite():
+                total += actual
+            continue
+        reserved = getattr(record, "reserved_cost_usd", None)
+        if not isinstance(reserved, Decimal) or not reserved.is_finite():
+            statuses.add("unavailable")
+            continue
+        bound = reserved
+        reported = getattr(record, "reported_cost_usd", None)
+        estimated = getattr(record, "estimated_cost_usd", None)
+        for candidate in (reported, estimated):
+            if (
+                isinstance(candidate, Decimal)
+                and candidate.is_finite()
+                and candidate > bound
+            ):
+                bound = candidate
+        total += bound
+    if not records:
+        return total, "unavailable"
+    if "pending" in statuses:
+        return total, "pending"
+    if "estimated" in statuses:
+        return total, "estimated"
+    if "actual" in statuses:
+        return total, "actual"
+    return total, "unavailable"
+
+
+def _one_time_cost_problems(
+    archive: ReplayArchive, summary: Mapping[str, object]
+) -> list[str]:
+    costs = summary.get("costs")
+    if not isinstance(costs, Mapping):
+        return ["stored cost summary is missing"]
+    problems: list[str] = []
+    optimization_known, optimization_status = _records_cost(
+        tuple(archive.optimization_requests.values())
+    )
+    development_known, development_status = _records_cost(
+        tuple(archive.development_requests.values())
+    )
+    for label, stored_cost, stored_status, known, status in (
+        (
+            "optimization",
+            costs.get("optimization_cost_usd"),
+            costs.get("optimization_cost_status"),
+            optimization_known,
+            optimization_status,
+        ),
+        (
+            "baseline development",
+            costs.get("baseline_development_cost_usd"),
+            costs.get("baseline_development_cost_status"),
+            development_known,
+            development_status,
+        ),
+    ):
+        if stored_status != status:
+            problems.append(
+                f"{label} cost status {stored_status!r} != archived {status!r}"
+            )
+        stored_decimal = _decimal_or_none(stored_cost)
+        if stored_decimal is None or not _close(stored_decimal, known):
+            problems.append(
+                f"{label} cost {stored_cost!r} != archived ledger total "
+                f"{known}"
+            )
+    return problems
+
+
+def _release_measurements(
+    archive: ReplayArchive,
+) -> list[PairedMeasurement]:
+    case_by_id = {case.case_id: case for case in archive.cases}
+    grouped: dict[str, dict[str, ArmMeasurement]] = {
+        case.case_id: {} for case in archive.cases
+    }
+    for outcome in archive.outcomes:
+        case = case_by_id.get(outcome.case_id)
+        if case is None:
+            raise ReleaseValidationError(
+                f"archived outcome references unknown case {outcome.case_id}"
+            )
+        score = _rescore(case, outcome)
+        grouped.setdefault(outcome.case_id, {})[outcome.phase] = ArmMeasurement(
+            case_id=outcome.case_id,
+            score=score,
+            valid=outcome.status == "ok",
+            cost_usd=outcome.cost_usd,
+            cost_status=outcome.cost_status,
+            latency_ms=outcome.latency_ms,
+            evaluate_percent=None,
+            input_sha256=outcome.input_sha256,
+        )
+    return [
+        PairedMeasurement(
+            case_id=case_id,
+            baseline=arms.get("baseline"),
+            optimized=arms.get("optimized"),
+        )
+        for case_id, arms in sorted(grouped.items())
+    ]
+
+
+def _outcome_consistency_problems(
+    archive: ReplayArchive, summary: Mapping[str, object]
+) -> list[str]:
+    """Recompute the verdict, validity gates, and economics from raw results."""
+    costs = summary.get("costs")
+    if not isinstance(costs, Mapping):
+        return ["stored cost summary is missing; economics cannot be verified"]
+    test_reuse = summary.get("test_reuse")
+    try:
+        measurements = _release_measurements(archive)
+        optimization_cost, optimization_status = _records_cost(
+            tuple(archive.optimization_requests.values())
+        )
+        development_cost, development_status = _records_cost(
+            tuple(archive.development_requests.values())
+        )
+        recomputed = summarize_benchmark(
+            measurements,
+            planned_case_count=len(archive.cases),
+            run_complete=archive.benchmark.status == "completed",
+            comparable=bool(summary.get("comparable")),
+            comparability_warnings=[],
+            optimization_cost_usd=optimization_cost,
+            optimization_cost_status=optimization_status,
+            baseline_development_cost_usd=development_cost,
+            baseline_development_cost_status=development_status,
+            protocol_sha256=str(summary.get("protocol_sha256") or ""),
+            task_config_sha256=str(summary.get("task_config_sha256") or ""),
+            test_reuse=(
+                test_reuse if isinstance(test_reuse, Mapping) else {}
+            ),
+            optimization_cost_breakdown=(
+                costs.get("optimization_breakdown")
+                if isinstance(costs.get("optimization_breakdown"), Mapping)
+                else None
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - report as a failed check
+        return [f"cannot reconstruct raw results: {exc}"]
+    problems = _one_time_cost_problems(archive, summary)
+    for key in (
+        "complete",
+        "complete_with_errors",
+        "comparable",
+        "inputs_equal",
+        "eligible_for_verdict",
+        "quality_non_regression_gate",
+        "verdict",
+        "verdict_reason",
+        "validity",
+    ):
+        if summary.get(key) != recomputed.get(key):
+            problems.append(
+                f"{key}: stored {summary.get(key)!r} != recomputed "
+                f"{recomputed.get(key)!r}"
+            )
+    stored_economics = summary.get("economics")
+    if not isinstance(stored_economics, Mapping):
+        problems.append("stored economics are missing")
+    elif dict(stored_economics) != recomputed.get("economics"):
+        problems.append(
+            "stored economics differ from the recalculated break-even"
+        )
+    return problems
 
 
 def _config_for(run_dir: Path) -> Mapping[str, object]:
@@ -680,13 +941,25 @@ def _acceptance_items(
             "behavior still requires the operator setup run.",
         )
     )
+    a2_states = {
+        status("dataset_contract"),
+        status("gold_approval"),
+    }
+    a2_status = (
+        "failed"
+        if "failed" in a2_states
+        else "verified"
+        if a2_states == {"verified"}
+        else "partial"
+    )
     items.append(
         ReleaseCheck(
             "A2",
-            status("dataset_contract"),
+            a2_status,
             "50 approved cases, 30/10/10 splits, sealed test, six-category "
-            "coverage, and frozen case hashes are checked against the "
-            "archived test snapshot.",
+            "coverage, frozen case hashes, archived approvals, and reviewer "
+            "independence are checked; human gold sign-off is required before "
+            "this item becomes verified.",
         )
     )
     items.append(
@@ -887,6 +1160,27 @@ def validate_release(
         not dataset_failures,
         "; ".join(dataset_failures) if dataset_failures else "; ".join(dataset_notes),
     )
+    gold_failures, gold_notes, human_complete = _gold_approval_check(
+        archive, data_dir
+    )
+    if gold_failures:
+        add("gold_approval", False, "; ".join(gold_failures + gold_notes))
+    elif human_complete:
+        add("gold_approval", True, "; ".join(gold_notes))
+    else:
+        checks.append(
+            ReleaseCheck(
+                "gold_approval",
+                "warning",
+                "; ".join(
+                    [
+                        "Independent automated approvals are valid, but the "
+                        "required human gold sign-off is incomplete.",
+                        *gold_notes,
+                    ]
+                ),
+            )
+        )
     add(
         "development_run",
         archive.development.status == "completed"
@@ -1054,11 +1348,18 @@ def validate_release(
         "planned case count, seed, requests, and economics are present.",
     )
     verdict = summary.get("verdict")
+    outcome_problems = _outcome_consistency_problems(archive, summary)
     add(
         "honest_outcome",
-        verdict in VERDICTS and summary.get("complete") is True,
-        f"complete={summary.get('complete')!r}, verdict={verdict!r}, "
-        f"validity={summary.get('validity', 'missing')!r}",
+        verdict in VERDICTS
+        and summary.get("complete") is True
+        and not outcome_problems,
+        "; ".join(outcome_problems)
+        or (
+            f"complete={summary.get('complete')!r}, verdict={verdict!r}, "
+            f"validity={summary.get('validity', 'missing')!r}; verdict, "
+            "gates, and economics match the reconstructed raw results."
+        ),
     )
     test_reuse = summary.get("test_reuse")
     exposure = protocol.exposure_index
@@ -1174,6 +1475,11 @@ def validate_release(
                         ]
                         if not first_exposure
                         else []
+                    ),
+                    *(
+                        f"{check.check_id}: {check.detail}"
+                        for check in checks
+                        if check.status == "warning"
                     ),
                 ]
             )

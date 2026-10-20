@@ -81,9 +81,12 @@ dependencies. Dependency changes require a deliberate `uv lock` and review.
 uv run streamlit run app.py --server.address 127.0.0.1
 ```
 
-The app opens in Replay Experiment mode without an API key. Replay reads only
-recorded local artifacts, makes no provider/catalog/billing request, and shows
-zero additional API calls or cost. Replay exposes all six screens: Comparison
+The app opens in Replay Experiment mode without an API key. For Live
+Experiment, launch it with `uv run --env-file .env streamlit run app.py
+--server.address 127.0.0.1` so the configured key and budgets reach the
+process (see the Live runbook below). Replay reads only recorded local
+artifacts, makes no provider/catalog/billing request, and shows zero
+additional API calls or cost. Replay exposes all six screens: Comparison
 shows stored paired metrics and per-case changes, and Playground is explicitly
 disabled for new inference. Live Experiment adds checkbox-confirmed
 optimization, paired benchmark, and unscored Playground actions, each with its
@@ -373,7 +376,7 @@ The baseline command prints the development run ID. Start the UI and use Live
 Experiment for the remaining phases:
 
 ```bash
-uv run streamlit run app.py --server.address 127.0.0.1
+uv run --env-file .env streamlit run app.py --server.address 127.0.0.1
 ```
 
 1. Open **Optimization**, select the completed development run, review the

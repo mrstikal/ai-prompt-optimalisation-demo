@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import json
 import shutil
 from decimal import Decimal
@@ -411,3 +413,49 @@ def test_release_validation_fails_on_credential_key(
     checks = {check.check_id: check for check in report.checks}
     assert checks["secret_scan"].status == "fail"
     assert "config.json" in checks["secret_scan"].detail
+
+
+def test_release_does_not_certify_automated_only_gold_approval(
+    release_workspace,
+) -> None:
+    report = release.validate_release(
+        runs_root=release_workspace["runs"],
+        programs_root=release_workspace["programs"],
+        repeats=2,
+    )
+    checks = {check.check_id: check for check in report.checks}
+    acceptance = {item.check_id: item for item in report.acceptance}
+    assert checks["gold_approval"].status == "warning"
+    assert "human gold sign-off" in checks["gold_approval"].detail
+    assert acceptance["A2"].status == "partial"
+    assert any(
+        warning.startswith("gold_approval:")
+        for warning in report.warnings
+    )
+
+
+def test_release_recomputes_verdict_and_economics(release_workspace) -> None:
+    from dspy_lab.artifacts import open_replay_archive
+
+    runs = release_workspace["runs"]
+    programs = release_workspace["programs"]
+    benchmark_dir = runs / "benchmarks" / "bench-s15"
+    archive = open_replay_archive(
+        benchmark_dir, runs_root=runs, programs_root=programs
+    )
+    summary = json.loads(
+        (benchmark_dir / "summary.json").read_text(encoding="utf-8")
+    )
+    assert release._outcome_consistency_problems(archive, summary) == []
+    tampered = copy.deepcopy(summary)
+    tampered["verdict"] = "baseline_preferred"
+    problems = release._outcome_consistency_problems(archive, tampered)
+    assert any("verdict" in problem for problem in problems)
+    tampered = copy.deepcopy(summary)
+    tampered["economics"]["break_even_articles"] += 1
+    problems = release._outcome_consistency_problems(archive, tampered)
+    assert any("economics" in problem for problem in problems)
+
+
+def test_records_cost_empty_ledger_is_unavailable() -> None:
+    assert release._records_cost([]) == (Decimal("0"), "unavailable")

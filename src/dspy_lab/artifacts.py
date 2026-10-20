@@ -36,12 +36,12 @@ from .program import (
     BASELINE_PROMPT_PATH,
     BASELINE_PROMPT_VERSION,
     EDITORIAL_RULES_PATH,
-    PROGRAM_SOURCE_PATH,
     STRICT_ADAPTER_VERSION,
     EditorialQA,
     baseline_schema,
     case_inputs,
     load_baseline_instructions,
+    program_source_sha256,
 )
 from .schemas import CaseRecord, Finding, RULES_VERSION
 
@@ -73,6 +73,18 @@ RequestStatus = Literal[
     "admitted", "in_flight", "succeeded", "pending", "released", "reconciled"
 ]
 CostStatus = Literal["none", "estimated", "actual", "pending"]
+RunStopReason = Literal[
+    "call_cap",
+    "cost_cap",
+    "cancelled",
+    "overrun",
+    "fatal_provider_error",
+    "compile_error",
+    "arm_fatal",
+    "fatal_error",
+    "budget_stop",
+    "incomplete",
+]
 
 _PATTERN_RUN_ID = r"^[a-z0-9][a-z0-9-]{0,63}$"
 _PATTERN_PROGRAM_ID = r"^program-[0-9a-f]{16}$"
@@ -733,12 +745,13 @@ class RunManifest(BaseModel):
     created_at: str
     finished_at: str | None = None
     versions: dict[str, str]
-    snapshot: SnapshotManifest
+    snapshot: SnapshotManifest | None = None
     programs: list[ProgramReference] = Field(min_length=1)
     links: RunLinks = Field(default_factory=RunLinks)
     benchmark: BenchmarkProtocol | None = None
     files: dict[str, str] = Field(default_factory=dict)
-    stop_reason: str | None = None
+    stop_reason: RunStopReason | None = None
+    error_message: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
     @field_validator("created_at", "finished_at")
@@ -791,6 +804,10 @@ class RunManifest(BaseModel):
         if missing_versions:
             raise ValueError(
                 f"run versions are missing {missing_versions}"
+            )
+        if self.kind != "playground" and self.snapshot is None:
+            raise ValueError(
+                f"{self.kind} runs require an input snapshot"
             )
         links = self.links
         if self.kind == "development":
@@ -1113,6 +1130,18 @@ class RecordedOptimizationRun:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordedPlaygroundRun:
+    """Validated read-only view of one recorded playground run."""
+
+    run_dir: Path
+    manifest: RunManifest
+    summary: Mapping[str, object]
+    requests: Mapping[str, RecordedRequest]
+    programs: Mapping[str, ProgramSnapshot]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ReplayArchive:
     benchmark_dir: Path
     benchmark: RunManifest
@@ -1197,7 +1226,7 @@ def save_program_artifact(
     signature_fields = _signature_fields_snapshot(predictor.signature)
     rules_sha256 = sha256_file(EDITORIAL_RULES_PATH)
     prompt_sha256 = sha256_file(BASELINE_PROMPT_PATH)
-    source_sha256 = sha256_file(PROGRAM_SOURCE_PATH)
+    source_sha256 = program_source_sha256()
     versions = collect_runtime_versions()
     identity_payload = _program_identity_payload(
         program_name="EditorialQA",
@@ -1506,7 +1535,7 @@ def _compatibility_mismatches(
         )
     if manifest.prompt_sha256 != sha256_file(BASELINE_PROMPT_PATH):
         mismatches.append("prompt_sha256 changed")
-    if manifest.source_sha256 != sha256_file(PROGRAM_SOURCE_PATH):
+    if manifest.source_sha256 != program_source_sha256():
         mismatches.append("program source_sha256 changed")
     current_schema = baseline_schema()
     if (
@@ -1782,21 +1811,22 @@ def write_run_manifest(
         raise ArtifactError(
             "run directory name must match manifest.run_id"
         )
-    required_snapshot_files = (
-        manifest.snapshot.cases_file,
-        manifest.snapshot.rules_file,
-    )
-    missing_snapshot_files = [
-        name
-        for name in required_snapshot_files
-        if name not in manifest.files
-    ]
-    if missing_snapshot_files:
-        raise ArtifactError(
-            "run manifest files must include snapshot files: "
-            f"{missing_snapshot_files}"
+    if manifest.snapshot is not None:
+        required_snapshot_files = (
+            manifest.snapshot.cases_file,
+            manifest.snapshot.rules_file,
         )
-    read_input_snapshot(run_dir, manifest.snapshot)
+        missing_snapshot_files = [
+            name
+            for name in required_snapshot_files
+            if name not in manifest.files
+        ]
+        if missing_snapshot_files:
+            raise ArtifactError(
+                "run manifest files must include snapshot files: "
+                f"{missing_snapshot_files}"
+            )
+        read_input_snapshot(run_dir, manifest.snapshot)
     verify_file_index(run_dir, manifest.files)
     manifest_text = _pretty_json_text(
         manifest.model_dump(mode="json")
@@ -1859,7 +1889,26 @@ def read_recorded_outcomes(
     return outcomes
 
 
+_REQUEST_STATUS_RANK = {
+    "admitted": 0,
+    "in_flight": 1,
+    "succeeded": 2,
+    "pending": 2,
+    "released": 2,
+    "reconciled": 2,
+}
+_TERMINAL_REQUEST_STATUSES = frozenset(
+    {"succeeded", "pending", "released", "reconciled"}
+)
+
+
 def read_recorded_requests(path: Path) -> dict[str, RecordedRequest]:
+    """Read requests, tolerating append-only lifecycle snapshots.
+
+    Completed runs are compacted to one line per call. An interrupted run may
+    contain admitted/in-flight/terminal lines for the same call; keep the most
+    advanced state. Contradictory terminal states remain an error.
+    """
     requests: dict[str, RecordedRequest] = {}
     for line_number, payload in enumerate(
         _read_jsonl(path), start=1
@@ -1873,11 +1922,32 @@ def read_recorded_requests(path: Path) -> dict[str, RecordedRequest]:
         _assert_no_secret_keys(
             payload, context=f"{path}:{line_number}"
         )
-        if request.call_id in requests:
+        previous = requests.get(request.call_id)
+        if previous is None:
+            requests[request.call_id] = request
+            continue
+        if previous.sequence != request.sequence:
             raise ReplayError(
-                f"{path}:{line_number}: duplicate call_id"
+                f"{path}:{line_number}: duplicate call_id with a different "
+                "sequence"
             )
-        requests[request.call_id] = request
+        if (
+            previous.status in _TERMINAL_REQUEST_STATUSES
+            and request.status in _TERMINAL_REQUEST_STATUSES
+            and previous.status != request.status
+            and not (
+                previous.status == "pending"
+                and request.status == "reconciled"
+            )
+        ):
+            raise ReplayError(
+                f"{path}:{line_number}: contradictory terminal states for "
+                f"{request.call_id}"
+            )
+        if _REQUEST_STATUS_RANK.get(request.status, -1) >= _REQUEST_STATUS_RANK.get(
+            previous.status, -1
+        ):
+            requests[request.call_id] = request
     return requests
 
 
@@ -2154,6 +2224,7 @@ def read_run_summary(
     expected_schema = {
         "development": "baseline_summary_v1",
         "benchmark": "benchmark_summary_v1",
+        "playground": "playground_summary_v1",
     }.get(manifest.kind)
     if (
         expected_schema is not None
@@ -2353,6 +2424,61 @@ def open_optimization_run(
         programs=programs,
         requests=requests,
         candidate_stats=candidate_stats,
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
+def open_playground_run(
+    run_dir: Path,
+    *,
+    runs_root: Path | None = None,
+    programs_root: Path = PROGRAMS_ROOT,
+) -> RecordedPlaygroundRun:
+    """Validate and read one recorded playground run without an LM."""
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise ArtifactNotFoundError(
+            f"playground run directory is missing: {run_dir}"
+        )
+    if run_dir.parent.name != "playground":
+        raise ReplayError("playground run must live under runs/playground/")
+    if (
+        runs_root is not None
+        and run_dir.parent != Path(runs_root) / "playground"
+    ):
+        raise ReplayError("playground run is outside the configured runs root")
+    manifest = read_run_manifest(run_dir)
+    if manifest.kind != "playground":
+        raise ReplayError("entrypoint must be a playground run")
+    verify_file_index(run_dir, manifest.files)
+    summary = read_run_summary(run_dir, manifest)
+    if summary is None:
+        raise ArtifactIncompleteError(
+            "playground summary is not archived"
+        )
+    requests: dict[str, RecordedRequest] = {}
+    if RUN_REQUESTS_FILENAME in manifest.files:
+        requests = read_recorded_requests(
+            run_dir / RUN_REQUESTS_FILENAME
+        )
+    programs: dict[str, ProgramSnapshot] = {}
+    for reference in manifest.programs:
+        snapshot = _read_program_snapshot_for_reference(
+            reference, Path(programs_root)
+        )
+        programs[snapshot.program_id] = snapshot
+    warnings = list(manifest.warnings)
+    if manifest.status != "completed":
+        warnings.append(
+            f"Playground status is {manifest.status!r}; this is not a "
+            "completed run."
+        )
+    return RecordedPlaygroundRun(
+        run_dir=run_dir,
+        manifest=manifest,
+        summary=summary,
+        requests=requests,
+        programs=programs,
         warnings=tuple(dict.fromkeys(warnings)),
     )
 
@@ -2874,9 +3000,11 @@ __all__ = [
     "RUN_MANIFEST_SCHEMA_VERSION",
     "RUN_OUTCOMES_FILENAME",
     "RUN_REQUESTS_FILENAME",
+    "RunStopReason",
     "RecordedDevelopmentRun",
     "RecordedOptimizationRun",
     "RecordedOutcome",
+    "RecordedPlaygroundRun",
     "RecordedRequest",
     "ReplayArchive",
     "ReplayError",
@@ -2905,6 +3033,7 @@ __all__ = [
     "load_program_artifact",
     "open_development_run",
     "open_optimization_run",
+    "open_playground_run",
     "open_replay_archive",
     "program_reference",
     "read_input_snapshot",

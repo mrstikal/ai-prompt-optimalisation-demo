@@ -1249,12 +1249,60 @@ def test_mapping_gold_crossing_derived_separator_fails_closed() -> None:
         )
 
 
-def test_two_separators_fail_closed() -> None:
+def test_every_gold_option_is_validated_after_a_match() -> None:
+    title = "Titulek"
+    body = "Tělo."
+    document = canonicalize_document(title, body)
+    anchor_start = document.index("Tělo")
+    valid = MatchOption(
+        anchor_start=anchor_start,
+        anchor_end=anchor_start + len("Tělo"),
+        context_start=0,
+        context_end=len(document),
+    )
+    invalid = MatchOption(
+        anchor_start=anchor_start,
+        anchor_end=anchor_start + len("Tělo"),
+        context_start=0,
+        context_end=len(document) + 1,
+    )
+    gold = GoldFinding(
+        issue_id="fixture-options",
+        code="PRODUCT_FACT_MISMATCH",
+        evidence="Tělo.",
+        explanation="Testovací vysvětlení.",
+        match_options=[valid, invalid],
+    )
     with pytest.raises(ScoringConfigurationError):
         score_case(
             {
-                "case_id": "fixture-two-separators",
-                "document_text": "T\n\nB\n\nC",
+                "case_id": "fixture-options",
+                "document_text": document,
+                "gold_findings": [gold.model_dump()],
+            },
+            make_prediction(),
+        )
+
+
+def test_paragraph_breaks_in_body_are_scorable() -> None:
+    scored = score_case(
+        {
+            "case_id": "fixture-two-separators",
+            "document_text": "T\n\nB\n\nC",
+            "gold_findings": [],
+        },
+        make_prediction(),
+    )
+    assert scored.valid is True
+
+
+def test_declared_title_must_prefix_document_text() -> None:
+    with pytest.raises(ScoringConfigurationError, match="canonical title"):
+        score_case(
+            {
+                "case_id": "fixture-title-prefix",
+                "title": "Titulek",
+                "document_text": "Jiný titulek\n\nTělo.",
                 "gold_findings": [],
             },
             make_prediction(),

@@ -151,7 +151,6 @@ def _validate_gold_finding(
         ):
             continue
         matched = True
-        break
     if not matched:
         raise DatasetValidationError(
             f"{case_id}/{issue.issue_id}: no match option contains the unique "

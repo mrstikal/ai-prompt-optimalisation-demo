@@ -16,6 +16,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 import dspy_lab.data as data_module
+import dspy_lab.jobs as jobs_module
 import dspy_lab.llm as llm_module
 import dspy_lab.preflight as preflight_module
 from dspy_lab.artifacts import (
@@ -398,6 +399,46 @@ def test_replay_unchanged_baseline_has_no_diff(
     assert all(code.language != "diff" for code in app.code)
 
 
+def test_replay_archive_read_is_cached_across_reruns(
+    tmp_path, monkeypatch
+) -> None:
+    original = app_module.open_replay_archive
+    calls: list[int] = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "open_replay_archive", counting)
+    app = _run_app(tmp_path, measured=True)
+    app = _select_screen(app, "Comparison")
+    first_reads = len(calls)
+    assert first_reads >= 1
+    app.run()
+    assert not app.exception, [str(item.value) for item in app.exception]
+    assert len(calls) == first_reads
+
+
+def test_comparison_rescoring_is_cached_across_reruns(
+    tmp_path, monkeypatch
+) -> None:
+    original = app_module._compute_comparison
+    calls: list[int] = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "_compute_comparison", counting)
+    app = _run_app(tmp_path, measured=True)
+    app = _select_screen(app, "Comparison")
+    first_computes = len(calls)
+    assert first_computes >= 1
+    app.run()
+    assert not app.exception, [str(item.value) for item in app.exception]
+    assert len(calls) == first_computes
+
+
 def test_replay_corrupt_archive_is_explicit_and_offline(
     monkeypatch, tmp_path
 ) -> None:
@@ -596,10 +637,30 @@ def test_cost_status_prefers_pending_and_settled_states() -> None:
         status(
             {
                 "unresolved_cost_usd": "0.5",
-                "actual_cost_usd": "1",
+                "actual_cost_usd": "0",
+                "estimated_cost_usd": "0",
             }
         )
         == "pending"
+    )
+    assert (
+        status(
+            {
+                "unresolved_cost_usd": "0.5",
+                "actual_cost_usd": "1",
+            }
+        )
+        == "actual"
+    )
+    assert (
+        status(
+            {
+                "unresolved_cost_usd": "0.1",
+                "actual_cost_usd": "0",
+                "estimated_cost_usd": "0.01",
+            }
+        )
+        == "estimated"
     )
     assert (
         status({"actual_cost_usd": "0.2", "estimated_cost_usd": "0.1"})
@@ -836,7 +897,7 @@ def test_job_manager_marks_interrupted_after_process_restart(
             "created_at": "2026-10-19T12:00:00Z",
         },
     )
-    monkeypatch.setattr(app_module, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(jobs_module, "_pid_alive", lambda _pid: False)
     manager = app_module.JobManager(runs, tmp_path / "programs")
     records = manager.recent_records()
     assert records
@@ -1027,7 +1088,7 @@ def test_interrupted_job_record_is_visible_after_restart(
             "max_cost_usd": "5.00",
         },
     )
-    monkeypatch.setattr(app_module, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(jobs_module, "_pid_alive", lambda _pid: False)
     app_module._JOB_MANAGER_OVERRIDE = None
     app = AppTest.from_file(
         str(_wrapper(tmp_path, fixture)),
@@ -1121,7 +1182,7 @@ def test_job_manager_marks_pid_reuse_interrupted(
             "max_cost_usd": "5.00",
         },
     )
-    monkeypatch.setattr(app_module, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(jobs_module, "_pid_alive", lambda _pid: True)
     manager = app_module.JobManager(runs, tmp_path / "programs")
     records = manager.recent_records()
     assert records
@@ -1259,7 +1320,7 @@ def test_job_manager_clears_stale_active_lock_before_start(
             "created_at": "2026-10-19T12:00:00Z",
         },
     )
-    monkeypatch.setattr(app_module, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(jobs_module, "_pid_alive", lambda _pid: False)
     manager = app_module.JobManager(
         runs, tmp_path / "programs", runner=ui_jobs.make_runner()
     )
@@ -1350,9 +1411,9 @@ def test_job_manager_process_start_token_mismatch_is_interrupted(
             "process_start_token": "same-start",
         },
     )
-    monkeypatch.setattr(app_module, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(jobs_module, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(
-        app_module,
+        jobs_module,
         "_process_start_token",
         lambda pid: "new-start" if pid == 424242 else "same-start",
     )
@@ -1381,7 +1442,7 @@ def test_job_manager_exclusive_lock_clears_stale_lock_after_init(
             "created_at": "2026-10-19T12:00:00Z",
         },
     )
-    monkeypatch.setattr(app_module, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(jobs_module, "_pid_alive", lambda _pid: False)
     handle = manager.start_job(
         _job_spec(
             tmp_path,
@@ -1426,7 +1487,7 @@ def test_job_manager_exclusive_lock_rejects_live_holder(
         },
     )
     monkeypatch.setattr(
-        app_module, "read_active_job_lock", lambda _root: None
+        jobs_module, "read_active_job_lock", lambda _root: None
     )
     with pytest.raises(app_module.JobBusyError):
         manager.start_job(
@@ -1817,6 +1878,7 @@ def test_benchmark_worker_passes_the_handle_ledger(
     monkeypatch, tmp_path
 ) -> None:
     import dspy_lab.experiments as experiments
+    from dspy_lab import jobs
 
     settings = app_module.Settings(
         mode="live", openrouter_api_key="sk-or-v1-s14-worker"
@@ -1858,7 +1920,7 @@ def test_benchmark_worker_passes_the_handle_ledger(
         programs_root=tmp_path / "programs",
         test_cases=(),
     )
-    app_module._run_benchmark_job(spec, handle)
+    jobs._run_benchmark_job(spec, handle)
     assert captured["ledger"] is ledger
 
 
@@ -1926,3 +1988,32 @@ def test_comparison_rescore_preserves_invalid_outcomes(tmp_path) -> None:
     assert score.tp == 0
     assert score.fp == 0
     assert score.fn == len(case.gold_findings)
+
+
+def test_job_specs_and_runner_are_stable_across_script_reruns() -> None:
+    import dspy_lab.jobs as jobs
+
+    assert app_module.OptimizationJobSpec is jobs.OptimizationJobSpec
+    assert app_module.BenchmarkJobSpec is jobs.BenchmarkJobSpec
+    assert app_module.PlaygroundJobSpec is jobs.PlaygroundJobSpec
+    assert app_module.run_paid_job is jobs.run_paid_job
+
+
+def test_process_instance_identity_is_stable_within_one_process() -> None:
+    assert app_module._stable_process_instance_id(
+        os.getpid()
+    ) == app_module.PROCESS_INSTANCE_ID
+
+
+def test_dspy_percent_scale_is_not_multiplied_twice() -> None:
+    assert app_module._percent_text(80.0) == "80.0%"
+    assert app_module._percent_delta_text(70.0, 80.0) == "+10.0 pp"
+    assert app_module._percent_text(None) == "N/A"
+
+
+def test_known_decimal_cost_delta_is_displayed() -> None:
+    assert app_module._money_delta_text(
+        Decimal("0.001"), Decimal("0.0025")
+    ) == "+0.0015"
+    assert app_module._money_delta_text("0.0025", "0.001") == "-0.0015"
+    assert app_module._money_delta_text(None, "0.001") == "N/A"

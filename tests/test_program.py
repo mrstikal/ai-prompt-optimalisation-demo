@@ -28,6 +28,7 @@ from dspy_lab.program import (
     baseline_fingerprint,
     baseline_manifest,
     baseline_schema,
+    program_source_sha256,
     case_inputs,
     fingerprint_payload,
     load_baseline_instructions,
@@ -644,7 +645,8 @@ def test_baseline_manifest_and_fingerprint_are_stable() -> None:
     assert manifest["prompt_sha256"] == hashlib.sha256(
         BASELINE_PROMPT_PATH.read_bytes()
     ).hexdigest()
-    assert manifest["source_sha256"] == hashlib.sha256(
+    assert manifest["source_sha256"] == program_source_sha256()
+    assert manifest["source_files"]["program.py"] == hashlib.sha256(
         Path(program_module.__file__).read_bytes()
     ).hexdigest()
     assert len(str(manifest["fingerprint"])) == 64
@@ -760,3 +762,24 @@ def test_strict_adapter_wraps_non_string_completion() -> None:
         )
     assert "completion must be a string" in str(exc_info.value)
     assert exc_info.value.lm_response is None
+
+
+def test_baseline_schema_captures_nested_contract() -> None:
+    schema = baseline_schema()
+    outputs = {item["name"]: item for item in schema["outputs"]}
+    finding_schema = outputs["findings"]["json_schema"]
+    finding_def = finding_schema["$defs"]["Finding"]
+    assert "UNSUPPORTED_NUMERIC_CLAIM" in finding_def["properties"]["code"][
+        "enum"
+    ]
+    assert finding_def["properties"]["evidence"]["maxLength"] == 320
+    assert finding_def["required"] == [
+        "code",
+        "evidence",
+        "explanation",
+    ]
+    assert finding_def["additionalProperties"] is False
+    inputs = {item["name"]: item for item in schema["inputs"]}
+    assert inputs["sources"]["json_schema"]["$defs"]["SourceRecord"][
+        "required"
+    ] == ["source_id", "excerpt", "provenance"]

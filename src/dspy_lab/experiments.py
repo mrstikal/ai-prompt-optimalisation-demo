@@ -19,12 +19,11 @@ import secrets
 import statistics
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 
 import dspy
 from dspy.teleprompt.gepa.gepa import DspyGEPAResult
@@ -45,6 +44,7 @@ from .artifacts import (
     RecordedRequest,
     RunLinks,
     RunManifest,
+    RunStopReason,
     append_jsonl,
     atomic_write_json,
     atomic_write_jsonl,
@@ -67,7 +67,9 @@ from .artifacts import (
     write_input_snapshot,
     write_run_manifest,
 )
+from .candidates import CandidateStatsError, gepa_candidate_records
 from .config import (
+    ConfigurationError,
     GEPA_CANDIDATE_SELECTION_STRATEGY,
     GEPA_REFLECTION_MINIBATCH_SIZE,
     GEPA_SEED,
@@ -79,6 +81,7 @@ from .config import (
 from .data import (
     TEST_ARTICLE_COUNT,
     VALIDATION_ARTICLE_COUNT,
+    canonical_document,
     canonical_document_sha256,
     canonicalize_document,
     canonicalize_text,
@@ -94,6 +97,11 @@ from .llm import (
     RequestRecord as LedgerRequestRecord,
     build_guarded_lm,
     conservative_token_counter,
+)
+from .preflight import (
+    PreflightError,
+    fetch_endpoint_catalog,
+    parse_endpoint_catalog,
 )
 from .metrics import (
     CaseScore,
@@ -140,8 +148,9 @@ MIN_OPTIMIZATION_HEADROOM_CALLS = 40
 FORMATTING_OVERHEAD_TOKENS = 4_096
 BASELINE_CANDIDATE_ID = "baseline"
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+FATAL_PROVIDER_STOP = "fatal_provider_error"
 _TERMINAL_BUDGET_STOPS = frozenset(
-    {"call_cap", "cost_cap", "overrun", "cancelled"}
+    {"call_cap", "cost_cap", "overrun", "cancelled", FATAL_PROVIDER_STOP}
 )
 
 
@@ -258,6 +267,7 @@ class PlaygroundResult:
 
     run_id: str
     run_dir: Path
+    manifest: RunManifest
     status: str
     optimization_run_id: str
     baseline: PlaygroundArmResult
@@ -384,9 +394,38 @@ def _validate_case_sequence(
     return case_list
 
 
+def _require_frozen_split_membership(
+    cases: Sequence[CaseRecord], *, split: str
+) -> None:
+    """Reject cases that are not exact members of the frozen split.
+
+    The IDs alone are insufficient: a caller could relabel a held-out record
+    or mutate its gold labels. Compare the complete canonical case payload
+    against the frozen train/validation files (the sealed test file is never
+    opened).
+    """
+    frozen = load_train_validation_cases(DATA_DIR)
+    frozen_cases = {case.case_id: case for case in frozen[split]}
+    for case in cases:
+        expected = frozen_cases.get(case.case_id)
+        if expected is None:
+            raise ExperimentConfigurationError(
+                f"{case.case_id}: case is not in the frozen {split} split"
+            )
+        if canonical_json_text(
+            case.model_dump(mode="json")
+        ) != canonical_json_text(expected.model_dump(mode="json")):
+            raise ExperimentConfigurationError(
+                f"{case.case_id}: case content differs from the frozen "
+                f"{split} split"
+            )
+
+
 def _validate_optimization_split(
     train_cases: Sequence[CaseRecord],
     validation_cases: Sequence[CaseRecord],
+    *,
+    origin: str = "live",
 ) -> tuple[list[CaseRecord], list[CaseRecord]]:
     train = _validate_case_sequence(train_cases, name="train cases")
     validation = _validate_case_sequence(
@@ -404,7 +443,41 @@ def _validate_optimization_split(
         raise ExperimentConfigurationError(
             "train and validation families must be disjoint"
         )
+    if origin == "live":
+        _require_frozen_split_membership(train, split="train")
+        _require_frozen_split_membership(validation, split="validation")
     return train, validation
+
+
+def _live_route_snapshots(settings: Settings) -> dict[str, object]:
+    """Fetch and validate the current catalog snapshot for both paid roles.
+
+    Historical hardcoded ceilings are not proof that the selected endpoint is
+    still available at an acceptable price or with the required parameters.
+    Each paid Live phase obtains its own read-only snapshot before dispatch.
+    """
+    snapshots: dict[str, object] = {}
+    try:
+        routes = (
+            ("task", settings.task_route(), settings.max_output_tokens),
+            (
+                "reflection",
+                settings.reflection_route(),
+                settings.reflection_max_output_tokens,
+            ),
+        )
+        for role, profile, output_cap in routes:
+            payload = fetch_endpoint_catalog(profile.model)
+            snapshots[role] = parse_endpoint_catalog(
+                payload,
+                profile=profile,
+                configured_output_tokens=output_cap,
+            ).to_dict()
+    except (PreflightError, ConfigurationError) as exc:
+        raise ExperimentConfigurationError(
+            f"live route catalog validation failed before dispatch: {exc}"
+        ) from exc
+    return snapshots
 
 
 def _validate_optimization_budget(settings: Settings) -> int:
@@ -684,6 +757,7 @@ def _request_payload(
 def _write_requests(
     run_dir: Path, ledger: BudgetLedger, secret: str | None
 ) -> None:
+    """Compact all request records once the phase reaches a terminal state."""
     atomic_write_jsonl(
         run_dir / RUN_REQUESTS_FILENAME,
         [
@@ -693,11 +767,95 @@ def _write_requests(
     )
 
 
+def _append_request(
+    run_dir: Path, record: LedgerRequestRecord, secret: str | None
+) -> None:
+    """Append one lifecycle record without rewriting earlier requests."""
+    append_jsonl(
+        run_dir / RUN_REQUESTS_FILENAME,
+        _request_payload(record, secret),
+    )
+
+
 def _append_event(run_dir: Path, event: Mapping[str, object]) -> None:
     append_jsonl(
         run_dir / "events.jsonl",
         {"at": _utc_string(), **dict(event)},
     )
+
+
+def _ledger_for_limits(
+    ledger: BudgetLedger | None,
+    limits: object,
+    *,
+    phase: str,
+) -> BudgetLedger:
+    if ledger is None:
+        return BudgetLedger.from_limits(limits)  # type: ignore[arg-type]
+    if not isinstance(ledger, BudgetLedger):
+        raise ExperimentConfigurationError(
+            f"{phase} ledger must be a BudgetLedger"
+        )
+    if (
+        ledger.max_calls != getattr(limits, "max_calls")
+        or ledger.max_cost_usd != getattr(limits, "max_cost_usd")
+    ):
+        raise ExperimentConfigurationError(
+            f"injected {phase} ledger limits do not match the confirmed "
+            f"{phase} budget"
+        )
+    return ledger
+
+
+def _prepare_run_files(
+    run_dir: Path,
+    config: Mapping[str, object],
+    *,
+    requests: bool = True,
+    outcomes: bool = False,
+) -> None:
+    atomic_write_json(run_dir / "config.json", config)
+    if outcomes:
+        atomic_write_jsonl(run_dir / RUN_OUTCOMES_FILENAME, [])
+    if requests:
+        atomic_write_jsonl(run_dir / RUN_REQUESTS_FILENAME, [])
+
+
+def _request_listener(
+    run_dir: Path,
+    secret: str | None,
+    *,
+    enabled: bool = True,
+) -> Callable[[LedgerRequestRecord], None] | None:
+    if not enabled:
+        return None
+    write_lock = threading.Lock()
+
+    def listener(record: LedgerRequestRecord) -> None:
+        with write_lock:
+            _append_request(run_dir, record, secret)
+
+    return listener
+
+
+def _token_totals(
+    records: Sequence[LedgerRequestRecord],
+) -> tuple[int | None, int | None]:
+    if not records:
+        return None, None
+    input_values = [record.input_tokens for record in records]
+    output_values = [record.output_tokens for record in records]
+    input_tokens = (
+        sum(value for value in input_values if value is not None)
+        if all(value is not None for value in input_values)
+        else None
+    )
+    output_tokens = (
+        sum(value for value in output_values if value is not None)
+        if all(value is not None for value in output_values)
+        else None
+    )
+    return input_tokens, output_tokens
 
 
 def _case_cost(
@@ -874,9 +1032,10 @@ def _run_manifest(
     links: RunLinks,
     run_dir: Path,
     file_names: Sequence[str],
-    stop_reason: str | None,
+    stop_reason: RunStopReason | None,
     warnings: Sequence[str],
     benchmark: BenchmarkProtocol | None = None,
+    error_message: str | None = None,
 ) -> RunManifest:
     files = file_index(run_dir, _file_names(run_dir, file_names))
     return RunManifest(
@@ -893,6 +1052,7 @@ def _run_manifest(
         benchmark=benchmark,
         files=files,
         stop_reason=stop_reason,
+        error_message=error_message,
         warnings=list(warnings),
     )
 
@@ -944,6 +1104,11 @@ def run_baseline_development(
     rules = _frozen_rules_text(rules_text)
     if origin not in ("live", "mock_test"):
         raise ExperimentConfigurationError("unsupported run origin")
+    if origin == "live":
+        _require_frozen_split_membership(case_list, split="validation")
+    route_snapshots = (
+        _live_route_snapshots(settings) if origin == "live" else {}
+    )
     run_id = _validate_run_id(run_id or _new_run_id("dev"))
     secret = settings.openrouter_api_key
     run_dir = _new_run_dir(Path(runs_root), "development", run_id)
@@ -975,10 +1140,9 @@ def run_baseline_development(
         cases=case_list,
         baseline_instructions=baseline_instructions,
         limits=limits,
+        extra={"route_catalog_snapshots": route_snapshots},
     )
-    atomic_write_json(run_dir / "config.json", config)
-    atomic_write_jsonl(run_dir / RUN_OUTCOMES_FILENAME, [])
-    atomic_write_jsonl(run_dir / RUN_REQUESTS_FILENAME, [])
+    _prepare_run_files(run_dir, config, outcomes=True)
     _append_event(
         run_dir,
         {
@@ -997,11 +1161,7 @@ def run_baseline_development(
         },
     )
     ledger = BudgetLedger.from_limits(limits)
-    write_lock = threading.Lock()
-
-    def listener(record: LedgerRequestRecord) -> None:
-        with write_lock:
-            _write_requests(run_dir, ledger, secret)
+    listener = _request_listener(run_dir, secret)
 
     task_lm = build_guarded_lm(
         settings,
@@ -1018,7 +1178,7 @@ def run_baseline_development(
 
     with dspy.context(lm=task_lm, adapter=StrictJSONAdapter()):
         for case in case_list:
-            request_count = len(ledger.records)
+            request_count = ledger.record_count
             started = time.perf_counter()
             error: str | None = None
             prediction = None
@@ -1040,7 +1200,7 @@ def run_baseline_development(
                 error = _sanitize_text(
                     f"{type(exc).__name__}: {exc}", secret
                 )
-            case_requests = ledger.records[request_count:]
+            case_requests = ledger.records_since(request_count)
             if prediction is not None:
                 score = score_case(case, prediction)
             else:
@@ -1191,7 +1351,13 @@ def run_baseline_development(
         )
     stop_reason = ledger_snapshot.stop_reason
     status = "completed"
-    if stop_reason in _TERMINAL_BUDGET_STOPS:
+    if stop_reason == FATAL_PROVIDER_STOP:
+        status = "failed"
+        warnings.append(
+            "baseline development stopped on a fatal provider/account "
+            "failure; remaining cases were not dispatched."
+        )
+    elif stop_reason in _TERMINAL_BUDGET_STOPS:
         status = "stopped"
         warnings.append(
             f"baseline development stopped at the confirmed budget: {stop_reason}."
@@ -1457,48 +1623,10 @@ def _gepa_settings_payload(settings: Settings, headroom: int) -> dict[str, objec
 def _candidate_instructions(
     stats: Mapping[str, object],
 ) -> list[dict[str, object]]:
-    candidates = stats.get("candidates")
-    parents = stats.get("parents")
-    scores = stats.get("val_aggregate_scores")
-    discovery = stats.get("discovery_eval_counts")
-    best_idx = stats.get("best_idx")
-    if not isinstance(candidates, list):
-        raise ExperimentError("GEPA stats do not contain candidates")
-    records: list[dict[str, object]] = []
-    for index, candidate in enumerate(candidates):
-        if not isinstance(candidate, Mapping):
-            raise ExperimentError("GEPA candidate is not an object")
-        instruction = candidate.get("predict")
-        if not isinstance(instruction, str) or not instruction.strip():
-            raise ExperimentError(
-                "GEPA candidate does not contain predictor instructions"
-            )
-        parents_value = None
-        if isinstance(parents, list) and index < len(parents):
-            parent_items = parents[index]
-            if isinstance(parent_items, list):
-                parents_value = list(parent_items)
-        records.append(
-            {
-                "candidate_id": f"candidate-{index}",
-                "candidate_index": index,
-                "instructions": {"predict": instruction},
-                "parents": parents_value,
-                "val_aggregate_score": (
-                    scores[index]
-                    if isinstance(scores, list) and index < len(scores)
-                    else None
-                ),
-                "discovery_eval_count": (
-                    discovery[index]
-                    if isinstance(discovery, list)
-                    and index < len(discovery)
-                    else None
-                ),
-                "selected": index == best_idx,
-            }
-        )
-    return records
+    try:
+        return gepa_candidate_records(stats)
+    except CandidateStatsError as exc:
+        raise ExperimentError(str(exc)) from exc
 
 
 def _valid_proposal_count(
@@ -1668,27 +1796,17 @@ def run_optimization(
     _require_confirmation(confirm_budget)
     limits = settings.optimization_budget()
     _validate_budget(limits)
-    if ledger is None:
-        ledger = BudgetLedger.from_limits(limits)
-    elif not isinstance(ledger, BudgetLedger):
-        raise ExperimentConfigurationError(
-            "optimization ledger must be a BudgetLedger"
-        )
-    elif (
-        ledger.max_calls != limits.max_calls
-        or ledger.max_cost_usd != limits.max_cost_usd
-    ):
-        raise ExperimentConfigurationError(
-            "injected optimization ledger limits do not match the confirmed "
-            "optimization budget"
-        )
+    ledger = _ledger_for_limits(ledger, limits, phase="optimization")
     headroom = _validate_optimization_budget(settings)
-    train, validation = _validate_optimization_split(
-        train_cases, validation_cases
-    )
-    rules = _frozen_rules_text(rules_text)
     if origin not in ("live", "mock_test"):
         raise ExperimentConfigurationError("unsupported run origin")
+    train, validation = _validate_optimization_split(
+        train_cases, validation_cases, origin=origin
+    )
+    rules = _frozen_rules_text(rules_text)
+    route_snapshots = (
+        _live_route_snapshots(settings) if origin == "live" else {}
+    )
     baseline_development_run_id = _validate_run_id(
         baseline_development_run_id
     )
@@ -1734,10 +1852,10 @@ def run_optimization(
         extra={
             "baseline_development_run_id": baseline_development_run_id,
             "gepa": _gepa_settings_payload(settings, headroom),
+            "route_catalog_snapshots": route_snapshots,
         },
     )
-    atomic_write_json(run_dir / "config.json", config)
-    atomic_write_jsonl(run_dir / RUN_REQUESTS_FILENAME, [])
+    _prepare_run_files(run_dir, config)
     _append_event(
         run_dir,
         {
@@ -1757,11 +1875,7 @@ def run_optimization(
             "fingerprint": expected_fingerprint,
         },
     )
-    write_lock = threading.Lock()
-
-    def listener(record: LedgerRequestRecord) -> None:
-        with write_lock:
-            _write_requests(run_dir, ledger, secret)
+    listener = _request_listener(run_dir, secret)
 
     task_lm = build_guarded_lm(
         settings,
@@ -1786,7 +1900,8 @@ def run_optimization(
     compile_error: str | None = None
     detailed: DspyGEPAResult | None = None
     status = "completed"
-    stop_reason: str | None = None
+    stop_reason: RunStopReason | None = None
+    error_message: str | None = None
     warnings: list[str] = []
     assessment: Mapping[str, object] = {}
     stats_payload: dict[str, object] | None = None
@@ -1926,7 +2041,14 @@ def run_optimization(
             f"{type(exc).__name__}: {exc}", secret
         )
         snapshot_budget = ledger.snapshot()
-        if snapshot_budget.stop_reason in _TERMINAL_BUDGET_STOPS:
+        if snapshot_budget.stop_reason == FATAL_PROVIDER_STOP:
+            status = "failed"
+            stop_reason = FATAL_PROVIDER_STOP
+            warnings.append(
+                "Optimization stopped on a fatal provider/account failure; "
+                "remaining requests were not dispatched."
+            )
+        elif snapshot_budget.stop_reason in _TERMINAL_BUDGET_STOPS:
             status = "stopped"
             stop_reason = snapshot_budget.stop_reason
             warnings.append(
@@ -1935,7 +2057,8 @@ def run_optimization(
             )
         else:
             status = "failed"
-            stop_reason = compile_error
+            stop_reason = "compile_error"
+            error_message = compile_error
             warnings.append(
                 "Optimization failed before a genuine selected candidate "
                 "was produced."
@@ -1971,7 +2094,16 @@ def run_optimization(
         )
 
     final_budget = ledger.snapshot()
-    if final_budget.stop_reason in _TERMINAL_BUDGET_STOPS and status == "completed":
+    if final_budget.stop_reason == FATAL_PROVIDER_STOP:
+        status = "failed"
+        stop_reason = FATAL_PROVIDER_STOP
+        warnings.append(
+            "A fatal provider/account failure invalidated the apparent "
+            "completion; no further requests were dispatched."
+        )
+        if stats_payload is not None:
+            stats_payload["status"] = status
+    elif final_budget.stop_reason in _TERMINAL_BUDGET_STOPS and status == "completed":
         status = "stopped"
         stop_reason = final_budget.stop_reason
         warnings.append(
@@ -2035,6 +2167,7 @@ def run_optimization(
             snapshot.rules_file,
         ),
         stop_reason=stop_reason,
+        error_message=error_message,
         warnings=warnings,
     )
     _write_manifest(run_dir, manifest, secret)
@@ -2159,17 +2292,40 @@ def _optimization_cost_breakdown(
             "note": f"Optimization requests are unreadable: {exc}",
         }
     validation_ids = {case.case_id for case in validation_cases}
-    validation_titles = {case.title for case in validation_cases}
-    train_titles = {
-        case.title
+    document_splits = [
+        (
+            canonical_document(case),
+            "validation" if case.case_id in validation_ids else "train",
+        )
         for case in optimization_cases
-        if case.case_id not in validation_ids
-    }
+    ]
+    if len({document for document, _ in document_splits}) != len(
+        document_splits
+    ):
+        raise ExperimentError(
+            "optimization cases do not have unique canonical documents"
+        )
 
     def record_cost(record: LedgerRequestRecord) -> Decimal | None:
         if record.reported_cost_usd is not None:
             return record.reported_cost_usd
         return record.estimated_cost_usd
+
+    def record_text(record: LedgerRequestRecord) -> str:
+        parts: list[str] = []
+
+        def collect(value: object) -> None:
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, Mapping):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+
+        collect(record.messages)
+        return "\n".join(parts)
 
     totals = {
         "task_train": Decimal("0"),
@@ -2189,13 +2345,14 @@ def _optimization_cost_breakdown(
             totals["unknown_task"] += cost
             unknown_count += 1
             continue
-        text = json.dumps(record.messages, ensure_ascii=False)
-        in_validation = any(title in text for title in validation_titles)
-        in_train = any(title in text for title in train_titles)
-        if in_validation and not in_train:
-            totals["task_validation"] += cost
-        elif in_train and not in_validation:
-            totals["task_train"] += cost
+        text = record_text(record)
+        matched_splits = {
+            split
+            for document, split in document_splits
+            if document and document in text
+        }
+        if len(matched_splits) == 1:
+            totals[f"task_{matched_splits.pop()}"] += cost
         else:
             totals["unknown_task"] += cost
             unknown_count += 1
@@ -2213,9 +2370,9 @@ def _optimization_cost_breakdown(
         "cost_status": status,
         "task_train_validation_split": split_status,
         "note": (
-            "Task requests are classified by matching their article titles "
-            "to the optimization snapshot; reflection and compression calls "
-            "are reported separately."
+            "Task requests are classified by locating their exact canonical "
+            "article text in the archived messages; reflection and "
+            "compression calls are reported separately."
         ),
     }
 
@@ -2681,7 +2838,7 @@ def _evaluate_benchmark_arm(
     ledger: BudgetLedger,
     secret: str | None,
 ) -> tuple[ArmMeasurement, RecordedOutcome, bool, str | None]:
-    request_start = len(ledger.records)
+    request_start = ledger.record_count
     started = time.perf_counter()
     evaluation = None
     escaped: Exception | None = None
@@ -2697,11 +2854,9 @@ def _evaluate_benchmark_arm(
                 failure_score=0.0,
             )
             evaluation = evaluator(program)  # type: ignore[arg-type]
-        except BudgetStop as exc:
-            escaped = exc
         except Exception as exc:
             escaped = exc
-    records = ledger.records[request_start:]
+    records = ledger.records_since(request_start)
     prediction = None
     evaluate_percent: float | None = None
     if evaluation is not None and len(evaluation.results) == 1:
@@ -2733,6 +2888,12 @@ def _evaluate_benchmark_arm(
                 or f"task request {failed_request.call_id} failed",
                 secret,
             )
+            if stop_reason == FATAL_PROVIDER_STOP:
+                fatal = error
+        elif stop_reason == FATAL_PROVIDER_STOP:
+            error = f"fatal provider stop before dispatch: {stop_reason}"
+            kind = "request_error"
+            fatal = error
         elif stop_reason in _TERMINAL_BUDGET_STOPS and not records:
             error = f"budget stop before dispatch: {stop_reason}"
             kind = "request_error"
@@ -2801,18 +2962,7 @@ def _evaluate_benchmark_arm(
         cost_status=cost_status,
         latency_ms=latency_ms,
     )
-    input_values = [record.input_tokens for record in records]
-    output_values = [record.output_tokens for record in records]
-    input_tokens = (
-        sum(value for value in input_values if value is not None)
-        if input_values and all(value is not None for value in input_values)
-        else None
-    )
-    output_tokens = (
-        sum(value for value in output_values if value is not None)
-        if output_values and all(value is not None for value in output_values)
-        else None
-    )
+    input_tokens, output_tokens = _token_totals(records)
     provider_values = [
         (record.finished_at - record.started_at).total_seconds() * 1000.0
         for record in records
@@ -2861,24 +3011,14 @@ def run_benchmark(
     _require_confirmation(confirm_budget)
     limits = settings.benchmark_budget()
     _validate_budget(limits)
-    if ledger is None:
-        ledger = BudgetLedger.from_limits(limits)
-    elif not isinstance(ledger, BudgetLedger):
-        raise ExperimentConfigurationError(
-            "benchmark ledger must be a BudgetLedger"
-        )
-    elif (
-        ledger.max_calls != limits.max_calls
-        or ledger.max_cost_usd != limits.max_cost_usd
-    ):
-        raise ExperimentConfigurationError(
-            "injected benchmark ledger limits do not match the confirmed "
-            "benchmark budget"
-        )
+    ledger = _ledger_for_limits(ledger, limits, phase="benchmark")
     test_list = _validate_case_sequence(test_cases, name="sealed test cases")
     rules = _frozen_rules_text(rules_text)
     if origin not in ("live", "mock_test"):
         raise ExperimentConfigurationError("unsupported run origin")
+    route_snapshots = (
+        _live_route_snapshots(settings) if origin == "live" else {}
+    )
     if not isinstance(release_results, bool):
         raise ExperimentConfigurationError(
             "release_results must be a boolean"
@@ -2967,6 +3107,7 @@ def run_benchmark(
         "case_ids": [case.case_id for case in test_list],
         "rules_version": RULES_VERSION,
         "task": _task_config_payload(settings),
+        "route_catalog_snapshots": route_snapshots,
         "budget": {
             "max_calls": limits.max_calls,
             "max_cost_usd": str(limits.max_cost_usd),
@@ -2984,9 +3125,7 @@ def run_benchmark(
         "provenance": reuse["provenance"],
         "test_reuse": reuse,
     }
-    atomic_write_json(run_dir / "config.json", config)
-    atomic_write_jsonl(run_dir / RUN_OUTCOMES_FILENAME, [])
-    atomic_write_jsonl(run_dir / RUN_REQUESTS_FILENAME, [])
+    _prepare_run_files(run_dir, config, outcomes=True)
     atomic_write_text(
         run_dir / TEST_REUSE_FILENAME, _pretty_json(reuse)
     )
@@ -3031,11 +3170,7 @@ def run_benchmark(
                 ),
             },
         )
-    write_lock = threading.Lock()
-
-    def listener(record: LedgerRequestRecord) -> None:
-        with write_lock:
-            _write_requests(run_dir, ledger, secret)
+    listener = _request_listener(run_dir, secret)
 
     task_lm = build_guarded_lm(
         settings,
@@ -3056,7 +3191,8 @@ def run_benchmark(
     measurements: list[PairedMeasurement] = []
     outcomes: list[RecordedOutcome] = []
     status = "completed"
-    stop_reason: str | None = None
+    stop_reason: RunStopReason | None = None
+    error_message: str | None = None
     fatal = False
     try:
         for case in test_list:
@@ -3095,7 +3231,8 @@ def run_benchmark(
                 )
                 if arm_fatal is not None:
                     fatal = True
-                    stop_reason = arm_fatal
+                    stop_reason = "arm_fatal"
+                    error_message = arm_fatal
                     break
                 if terminal:
                     stop_reason = ledger.snapshot().stop_reason
@@ -3113,22 +3250,29 @@ def run_benchmark(
                 break
     except Exception as exc:
         fatal = True
-        stop_reason = _sanitize_text(
+        stop_reason = "fatal_error"
+        error_message = _sanitize_text(
             f"{type(exc).__name__}: {exc}", secret
         )
         _append_event(
             run_dir,
-            {"event": "benchmark_fatal", "error": stop_reason},
+            {"event": "benchmark_fatal", "error": error_message},
         )
     final_budget = ledger.snapshot()
-    if final_budget.stop_reason in _TERMINAL_BUDGET_STOPS:
+    if final_budget.stop_reason == FATAL_PROVIDER_STOP:
+        status = "failed"
+        stop_reason = FATAL_PROVIDER_STOP
+    elif final_budget.stop_reason in _TERMINAL_BUDGET_STOPS:
         status = "stopped"
         stop_reason = final_budget.stop_reason
     elif fatal:
         status = "failed"
     elif len(outcomes) != len(test_list) * 2:
         status = "failed"
-        stop_reason = "benchmark ended before all planned arm evaluations"
+        stop_reason = "incomplete"
+        error_message = (
+            "benchmark ended before all planned arm evaluations"
+        )
     _write_requests(run_dir, ledger, secret)
     comparability_warnings = list(reuse["warnings"])
     comparability_warnings.extend(links.cost_warnings)
@@ -3274,6 +3418,7 @@ def run_benchmark(
             snapshot.rules_file,
         ),
         stop_reason=stop_reason,
+        error_message=error_message,
         warnings=manifest_warnings,
         benchmark=protocol,
     )
@@ -3319,20 +3464,7 @@ def run_playground(
     _require_confirmation(confirm_budget)
     limits = settings.playground_budget()
     _validate_budget(limits)
-    if ledger is None:
-        ledger = BudgetLedger.from_limits(limits)
-    elif not isinstance(ledger, BudgetLedger):
-        raise ExperimentConfigurationError(
-            "playground ledger must be a BudgetLedger"
-        )
-    elif (
-        ledger.max_calls != limits.max_calls
-        or ledger.max_cost_usd != limits.max_cost_usd
-    ):
-        raise ExperimentConfigurationError(
-            "injected playground ledger limits do not match the confirmed "
-            "playground budget"
-        )
+    ledger = _ledger_for_limits(ledger, limits, phase="playground")
     if not isinstance(retain_content, bool):
         raise ExperimentConfigurationError(
             "retain_content must be a boolean"
@@ -3423,6 +3555,23 @@ def run_playground(
             "playground requires a completed Live baseline development run"
         )
     rules = _frozen_rules_text(optimization.rules_text)
+    optimization_config = _read_json_object(
+        optimization.run_dir / "config.json"
+    )
+    archived_task = optimization_config.get("task")
+    if not isinstance(archived_task, Mapping):
+        raise ExperimentIncompleteError(
+            "optimization run has no archived task configuration"
+        )
+    current_task = _task_config_payload(settings)
+    if dict(archived_task) != current_task:
+        raise ExperimentConfigurationError(
+            "playground settings would change the archived inference "
+            "protocol (model, provider, temperature, output cap, schema, or "
+            "adapter); restore the archived task configuration before "
+            "dispatch"
+        )
+    route_snapshots = _live_route_snapshots(settings)
     baseline_loaded = load_program_artifact(
         Path(programs_root) / baseline_id
     )
@@ -3448,33 +3597,32 @@ def run_playground(
             )
     run_dir = _new_run_dir(Path(runs_root), "playground", run_id)
     created_at = _utc_string()
-    atomic_write_json(
-        run_dir / "config.json",
-        {
-            "schema_version": PLAYGROUND_CONFIG_SCHEMA_VERSION,
-            "run_id": run_id,
-            "origin": "live",
-            "created_at": created_at,
-            "optimization_run_id": optimization_run_id,
-            "baseline_development_run_id": development_id,
-            "baseline_program_id": baseline_id,
-            "optimized_program_id": optimized_id,
-            "task": _task_config_payload(settings),
-            "rules_version": RULES_VERSION,
-            "rules_sha256": sha256_text(rules),
-            "title_sha256": sha256_text(canonical_title),
-            "article_sha256": sha256_text(document_text),
-            "title_length": len(canonical_title),
-            "article_length": len(document_text),
-            "retain_content": retain_content,
-            "budget": {
-                "max_calls": limits.max_calls,
-                "max_cost_usd": str(limits.max_cost_usd),
-            },
+    config = {
+        "schema_version": PLAYGROUND_CONFIG_SCHEMA_VERSION,
+        "run_id": run_id,
+        "origin": "live",
+        "created_at": created_at,
+        "optimization_run_id": optimization_run_id,
+        "baseline_development_run_id": development_id,
+        "baseline_program_id": baseline_id,
+        "optimized_program_id": optimized_id,
+        "task": dict(archived_task),
+        "route_catalog_snapshots": route_snapshots,
+        "rules_version": RULES_VERSION,
+        "rules_sha256": sha256_text(rules),
+        "title_sha256": sha256_text(canonical_title),
+        "article_sha256": sha256_text(document_text),
+        "title_length": len(canonical_title),
+        "article_length": len(document_text),
+        "retain_content": retain_content,
+        "budget": {
+            "max_calls": limits.max_calls,
+            "max_cost_usd": str(limits.max_cost_usd),
         },
+    }
+    _prepare_run_files(
+        run_dir, config, requests=retain_content
     )
-    if retain_content:
-        atomic_write_jsonl(run_dir / RUN_REQUESTS_FILENAME, [])
     _append_event(
         run_dir,
         {
@@ -3485,13 +3633,9 @@ def run_playground(
             "optimized_program_id": optimized_id,
         },
     )
-    write_lock = threading.Lock()
-
-    def listener(record: LedgerRequestRecord) -> None:
-        if not retain_content:
-            return
-        with write_lock:
-            _write_requests(run_dir, ledger, secret)
+    listener = _request_listener(
+        run_dir, secret, enabled=retain_content
+    )
 
     task_lm = build_guarded_lm(
         settings,
@@ -3506,11 +3650,11 @@ def run_playground(
         "optimized": optimized_loaded,
     }
     arm_results: dict[str, PlaygroundArmResult] = {}
-    stop_reason: str | None = None
+    stop_reason: RunStopReason | None = None
     with dspy.context(lm=task_lm, adapter=StrictJSONAdapter()):
         for arm in ("baseline", "optimized"):
             loaded = programs[arm]
-            request_count = len(ledger.records)
+            request_count = ledger.record_count
             started = time.perf_counter()
             error: str | None = None
             error_kind: str | None = None
@@ -3560,10 +3704,11 @@ def run_playground(
                 else:
                     error = "prediction did not expose a findings list"
                     error_kind = "missing_output"
-            records = ledger.records[request_count:]
+            records = ledger.records_since(request_count)
             cost_usd, cost_status = _case_cost(records)
             latency_ms = (time.perf_counter() - started) * 1000.0
             request_ids = tuple(record.call_id for record in records)
+            input_tokens, output_tokens = _token_totals(records)
             arm_results[arm] = PlaygroundArmResult(
                 arm=arm,
                 program_id=loaded.manifest.program_id,
@@ -3581,24 +3726,8 @@ def run_playground(
                 cost_usd=cost_usd,
                 cost_status=cost_status,
                 latency_ms=latency_ms,
-                input_tokens=sum(
-                    record.input_tokens or 0
-                    for record in records
-                    if record.input_tokens is not None
-                )
-                if records and all(
-                    record.input_tokens is not None for record in records
-                )
-                else None,
-                output_tokens=sum(
-                    record.output_tokens or 0
-                    for record in records
-                    if record.output_tokens is not None
-                )
-                if records and all(
-                    record.output_tokens is not None for record in records
-                )
-                else None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
             _append_event(
                 run_dir,
@@ -3614,7 +3743,10 @@ def run_playground(
             if stop_reason in _TERMINAL_BUDGET_STOPS:
                 break
     final_budget = ledger.snapshot()
-    if final_budget.stop_reason in _TERMINAL_BUDGET_STOPS:
+    if final_budget.stop_reason == FATAL_PROVIDER_STOP:
+        status = "failed"
+        stop_reason = FATAL_PROVIDER_STOP
+    elif final_budget.stop_reason in _TERMINAL_BUDGET_STOPS:
         status = "stopped"
         stop_reason = final_budget.stop_reason
     else:
@@ -3721,9 +3853,43 @@ def run_playground(
             "stop_reason": stop_reason,
         },
     )
+    program_refs = [program_reference(Path(programs_root) / baseline_id)]
+    if optimized_id != baseline_id:
+        program_refs.append(
+            program_reference(Path(programs_root) / optimized_id)
+        )
+    file_names = [
+        "config.json",
+        PLAYGROUND_SUMMARY_FILENAME,
+        "events.jsonl",
+    ]
+    if retain_content:
+        file_names.append(RUN_REQUESTS_FILENAME)
+    manifest = _run_manifest(
+        run_id=run_id,
+        kind="playground",
+        origin="live",
+        status=status,
+        created_at=created_at,
+        finished_at=finished_at,
+        snapshot=None,
+        programs=program_refs,
+        links=RunLinks(
+            baseline_development_run_id=development_id,
+            optimization_run_id=optimization_run_id,
+            baseline_program_id=baseline_id,
+            optimized_program_id=optimized_id,
+        ),
+        run_dir=run_dir,
+        file_names=file_names,
+        stop_reason=stop_reason,
+        warnings=warnings,
+    )
+    _write_manifest(run_dir, manifest, secret)
     return PlaygroundResult(
         run_id=run_id,
         run_dir=run_dir,
+        manifest=manifest,
         status=status,
         optimization_run_id=optimization_run_id,
         baseline=arm_results["baseline"],

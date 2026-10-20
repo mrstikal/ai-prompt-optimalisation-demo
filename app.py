@@ -8,18 +8,14 @@ Inspector remain read-only in both modes.
 
 from __future__ import annotations
 
-import difflib
 import hashlib
 import json
 import math
-import os
-import re
 import secrets
 import statistics
 import threading
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
@@ -32,22 +28,24 @@ from dspy_lab.artifacts import (
     ProgramManifest,
     ProgramSnapshot,
     RecordedDevelopmentRun,
+    RecordedOptimizationRun,
     RecordedOutcome,
+    RecordedPlaygroundRun,
     RecordedRequest,
     ReplayArchive,
     RunDirectoryEntry,
     RunManifest,
-    append_jsonl,
-    atomic_write_json,
     format_preview_trace,
     format_sent_trace,
     is_measured_archive,
     list_run_directories,
     open_development_run,
     open_optimization_run,
+    open_playground_run,
     open_replay_archive,
     read_run_manifest,
 )
+from dspy_lab.candidates import inspectable_candidate_records
 from dspy_lab.config import (
     DEFAULT_MAX_OPTIMIZATION_METRIC_CALLS,
     DEFAULT_REFLECTION_MODEL,
@@ -63,23 +61,89 @@ from dspy_lab.data import (
     load_review_audit,
     load_split_manifest,
 )
+from dspy_lab.jobs import (
+    ACTIVE_JOB_LOCK_FILENAME,
+    JOB_ACTIVE_STATUSES,
+    JOB_FOLDERS,
+    JOB_KIND_BENCHMARK,
+    JOB_KIND_OPTIMIZATION,
+    JOB_KIND_PLAYGROUND,
+    JOB_REGISTRY_DIRNAME,
+    JOB_RUN_ID_PATTERN,
+    JOB_SCHEMA_VERSION,
+    JOB_STATUS_CANCELLING,
+    JOB_STATUS_COMPLETED,
+    JOB_STATUS_FAILED,
+    JOB_STATUS_INTERRUPTED,
+    JOB_STATUS_RUNNING,
+    JOB_STATUS_STOPPED,
+    MODE_LIVE,
+    PROCESS_INSTANCE_ID,
+    BenchmarkJobSpec,
+    JobBusyError,
+    JobGateError,
+    JobHandle,
+    JobManager,
+    JobStaleError,
+    OptimizationJobSpec,
+    PlaygroundJobSpec,
+    _new_job_run_id,
+    _pid_alive,
+    _process_start_token,
+    _redact_secret,
+    _stable_process_instance_id,
+    _utc_now,
+    read_active_job_lock,
+    run_paid_job,
+)
 from dspy_lab.llm import BudgetLedger, BudgetSnapshot
-from dspy_lab.metrics import InvalidPrediction, score_case
+from dspy_lab.recorded_scoring import rescore_recorded_outcome
 from dspy_lab.program import (
     case_inputs,
     load_baseline_instructions,
 )
+from dspy_lab.ui_format import (
+    _comparison_effective,
+    _cost_status_from_payload,
+    _cost_value,
+    _count_delta_text,
+    _decimal_number,
+    _decimal_or_none,
+    _int_value,
+    _latency,
+    _message_content,
+    _metric_int,
+    _metric_number,
+    _money_delta_text,
+    _money_text,
+    _number,
+    _number_delta_text,
+    _outcome_cost,
+    _percent,
+    _percent_delta_text,
+    _percent_text,
+    _rate_delta_text,
+    _rate_text,
+    _ratio,
+    _same_schema,
+    _unified_diff,
+)
 from dspy_lab.schemas import (
     ALLOWED_CODES,
     CaseRecord,
-    EditorialQAOutput,
+    Finding,
     ProductFacts,
     SourceRecord,
 )
 
 DATA_DIR = PROJECT_ROOT / "data" / "v1"
 MODE_REPLAY = "Replay Experiment"
-MODE_LIVE = "Live Experiment"
+RUN_FOLDERS = {
+    "development": "development",
+    "optimization": "optimization",
+    "benchmark": "benchmarks",
+    "playground": "playground",
+}
 SCREENS = (
     "Overview",
     "Baseline",
@@ -114,6 +178,285 @@ CODE_DESCRIPTIONS = {
         "facts."
     ),
 }
+
+
+def _path_signature(
+    path: Path,
+) -> tuple[tuple[str, int, int], ...] | None:
+    """Cheap stat-only fingerprint used only as a cache key."""
+    try:
+        if not path.exists():
+            return (("__missing__", 0, 0),)
+        if path.is_file():
+            stat = path.stat()
+            return ((path.name, stat.st_mtime_ns, stat.st_size),)
+        entries: list[tuple[str, int, int]] = []
+        for child in path.rglob("*"):
+            if child.is_file() and not child.is_symlink():
+                stat = child.stat()
+                entries.append(
+                    (
+                        str(child.relative_to(path)),
+                        stat.st_mtime_ns,
+                        stat.st_size,
+                    )
+                )
+        return tuple(sorted(entries))
+    except OSError:
+        return None
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _run_listing_signature(kind: str) -> tuple[object, ...] | None:
+    folder = RUNS_ROOT / RUN_FOLDERS.get(kind, kind)
+    try:
+        if not folder.is_dir():
+            return (("__missing__",),)
+        entries: list[tuple[object, ...]] = []
+        for child in sorted(folder.iterdir(), key=lambda item: item.name):
+            if not child.is_dir() or child.is_symlink():
+                continue
+            directory_stat = child.stat()
+            manifest_path = child / "manifest.json"
+            manifest_signature = _file_signature(manifest_path)
+            entries.append(
+                (
+                    child.name,
+                    directory_stat.st_mtime_ns,
+                    manifest_signature,
+                )
+            )
+        return tuple(entries)
+    except OSError:
+        return None
+
+
+def _run_signature(
+    run_dir: Path,
+) -> tuple[tuple[tuple[str, int, int], ...] | None, ...] | None:
+    try:
+        manifest = read_run_manifest(run_dir)
+    except Exception:  # noqa: BLE001 - an uncached read will report the error
+        return None
+    paths = [Path(run_dir)]
+    paths.extend(
+        PROGRAMS_ROOT / reference.program_id
+        for reference in manifest.programs
+    )
+    signatures = tuple(_path_signature(path) for path in paths)
+    if any(signature is None for signature in signatures):
+        return None
+    return signatures
+
+
+def _archive_signature(
+    run_dir: Path,
+) -> tuple[tuple[tuple[str, int, int], ...] | None, ...] | None:
+    try:
+        manifest = read_run_manifest(run_dir)
+    except Exception:  # noqa: BLE001 - an uncached read will report the error
+        return None
+    paths = [Path(run_dir)]
+    for kind, run_id in (
+        ("development", manifest.links.baseline_development_run_id),
+        ("optimization", manifest.links.optimization_run_id),
+    ):
+        if run_id is None:
+            continue
+        linked_dir = RUNS_ROOT / kind / run_id
+        paths.append(linked_dir)
+        try:
+            linked = read_run_manifest(linked_dir)
+        except Exception:  # noqa: BLE001
+            continue
+        paths.extend(
+            PROGRAMS_ROOT / reference.program_id
+            for reference in linked.programs
+        )
+    paths.extend(
+        PROGRAMS_ROOT / reference.program_id
+        for reference in manifest.programs
+    )
+    signatures = tuple(_path_signature(path) for path in paths)
+    if any(signature is None for signature in signatures):
+        return None
+    return signatures
+
+
+@st.cache_resource(show_spinner=False, max_entries=32)
+def _cached_run_directories(
+    runs_root: str,
+    kind: str,
+    signature: tuple[object, ...],
+) -> tuple[RunDirectoryEntry, ...]:
+    del signature
+    return list_run_directories(Path(runs_root), kind=kind)  # type: ignore[arg-type]
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def _cached_replay_archive(
+    run_dir: str,
+    runs_root: str,
+    programs_root: str,
+    signature: tuple[object, ...],
+) -> ReplayArchive:
+    del signature
+    return open_replay_archive(
+        Path(run_dir),
+        runs_root=Path(runs_root),
+        programs_root=Path(programs_root),
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def _cached_development_run(
+    run_dir: str,
+    runs_root: str,
+    programs_root: str,
+    signature: tuple[object, ...],
+) -> RecordedDevelopmentRun:
+    del signature
+    return open_development_run(
+        Path(run_dir),
+        runs_root=Path(runs_root),
+        programs_root=Path(programs_root),
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def _cached_optimization_run(
+    run_dir: str,
+    runs_root: str,
+    programs_root: str,
+    signature: tuple[object, ...],
+) -> RecordedOptimizationRun:
+    del signature
+    return open_optimization_run(
+        Path(run_dir),
+        runs_root=Path(runs_root),
+        programs_root=Path(programs_root),
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def _cached_playground_run(
+    run_dir: str,
+    runs_root: str,
+    programs_root: str,
+    signature: tuple[object, ...],
+) -> RecordedPlaygroundRun:
+    del signature
+    return open_playground_run(
+        Path(run_dir),
+        runs_root=Path(runs_root),
+        programs_root=Path(programs_root),
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _cached_optimization_cases(
+    train_path: str,
+    validation_path: str,
+    signature: tuple[object, ...],
+) -> dict[str, list[CaseRecord]]:
+    del signature
+    return load_optimization_cases(
+        Path(train_path), Path(validation_path)
+    )
+
+
+def _run_directories(kind: str) -> tuple[RunDirectoryEntry, ...]:
+    signature = _run_listing_signature(kind)
+    if signature is None:
+        return list_run_directories(
+            RUNS_ROOT, kind=kind  # type: ignore[arg-type]
+        )
+    return _cached_run_directories(str(RUNS_ROOT), kind, signature)
+
+
+def _read_replay_archive(run_dir: Path) -> ReplayArchive:
+    signature = _archive_signature(run_dir)
+    if signature is None:
+        return open_replay_archive(
+            run_dir,
+            runs_root=RUNS_ROOT,
+            programs_root=PROGRAMS_ROOT,
+        )
+    return _cached_replay_archive(
+        str(run_dir),
+        str(RUNS_ROOT),
+        str(PROGRAMS_ROOT),
+        signature,
+    )
+
+
+def _read_development_run(run_dir: Path) -> RecordedDevelopmentRun:
+    signature = _run_signature(run_dir)
+    if signature is None:
+        return open_development_run(
+            run_dir,
+            runs_root=RUNS_ROOT,
+            programs_root=PROGRAMS_ROOT,
+        )
+    return _cached_development_run(
+        str(run_dir),
+        str(RUNS_ROOT),
+        str(PROGRAMS_ROOT),
+        signature,
+    )
+
+
+def _read_optimization_run(run_dir: Path) -> RecordedOptimizationRun:
+    signature = _run_signature(run_dir)
+    if signature is None:
+        return open_optimization_run(
+            run_dir,
+            runs_root=RUNS_ROOT,
+            programs_root=PROGRAMS_ROOT,
+        )
+    return _cached_optimization_run(
+        str(run_dir),
+        str(RUNS_ROOT),
+        str(PROGRAMS_ROOT),
+        signature,
+    )
+
+
+def _read_playground_run(run_dir: Path) -> RecordedPlaygroundRun:
+    signature = _run_signature(run_dir)
+    if signature is None:
+        return open_playground_run(
+            run_dir,
+            runs_root=RUNS_ROOT,
+            programs_root=PROGRAMS_ROOT,
+        )
+    return _cached_playground_run(
+        str(run_dir),
+        str(RUNS_ROOT),
+        str(PROGRAMS_ROOT),
+        signature,
+    )
+
+
+def _read_optimization_cases() -> dict[str, list[CaseRecord]]:
+    train_path = DATA_DIR / "train.jsonl"
+    validation_path = DATA_DIR / "validation.jsonl"
+    train_signature = _file_signature(train_path)
+    validation_signature = _file_signature(validation_path)
+    if train_signature is None or validation_signature is None:
+        return load_optimization_cases(train_path, validation_path)
+    return _cached_optimization_cases(
+        str(train_path),
+        str(validation_path),
+        (train_signature, validation_signature),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,853 +520,6 @@ class ComparisonView:
     historical: bool
     measured: bool
     warnings: tuple[str, ...]
-
-
-JOB_SCHEMA_VERSION = "ui_job_v1"
-JOB_STATUS_RUNNING = "running"
-JOB_STATUS_CANCELLING = "cancelling"
-JOB_STATUS_COMPLETED = "completed"
-JOB_STATUS_STOPPED = "stopped"
-JOB_STATUS_FAILED = "failed"
-JOB_STATUS_INTERRUPTED = "interrupted"
-JOB_ACTIVE_STATUSES = frozenset(
-    {JOB_STATUS_RUNNING, JOB_STATUS_CANCELLING}
-)
-JOB_KIND_OPTIMIZATION = "optimization"
-JOB_KIND_BENCHMARK = "benchmark"
-JOB_KIND_PLAYGROUND = "playground"
-JOB_FOLDERS = {
-    JOB_KIND_OPTIMIZATION: "optimization",
-    JOB_KIND_BENCHMARK: "benchmarks",
-    JOB_KIND_PLAYGROUND: "playground",
-}
-JOB_RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
-JOB_REGISTRY_DIRNAME = "jobs"
-ACTIVE_JOB_LOCK_FILENAME = ".active.lock"
-PROCESS_INSTANCE_ID = secrets.token_hex(8)
-
-
-class JobGateError(RuntimeError):
-    """Base error for rejected server-side job submissions."""
-
-
-class JobBusyError(JobGateError):
-    """Raised when another Live job is already active."""
-
-
-class JobStaleError(JobGateError):
-    """Raised for a consumed token, changed mode, or existing run ID."""
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _redact_secret(text: str, secret: str | None) -> str:
-    if secret:
-        text = text.replace(secret, "[REDACTED]")
-    return re.sub(r"sk-or-[A-Za-z0-9._-]+", "[REDACTED]", text)
-
-
-def _token_sha256(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def _new_job_run_id(prefix: str = "opt") -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ").lower()
-    return f"{prefix}-{stamp}-{secrets.token_hex(3)}"
-
-
-def _process_start_token(pid: object) -> str | None:
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return None
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-    marker = stat.rfind(")")
-    if marker < 0:
-        return None
-    fields = stat[marker + 2 :].split()
-    return fields[19] if len(fields) > 19 else None
-
-
-def _pid_alive(pid: object) -> bool:
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def _read_json_file(path: Path) -> Mapping[str, object] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeError):
-        return None
-    return payload if isinstance(payload, Mapping) else None
-
-
-def read_active_job_lock(
-    runs_root: Path = RUNS_ROOT,
-) -> Mapping[str, object] | None:
-    """Return the live active-job lock without creating or mutating anything."""
-    path = Path(runs_root) / JOB_REGISTRY_DIRNAME / ACTIVE_JOB_LOCK_FILENAME
-    payload = _read_json_file(path)
-    if payload is None or not _pid_alive(payload.get("pid")):
-        return None
-    if (
-        payload.get("pid") == os.getpid()
-        and payload.get("process_instance_id")
-        not in (None, PROCESS_INSTANCE_ID)
-    ):
-        return None
-    recorded_start = payload.get("process_start_token")
-    current_start = _process_start_token(payload.get("pid"))
-    if (
-        isinstance(recorded_start, str)
-        and current_start is not None
-        and recorded_start != current_start
-    ):
-        return None
-    return payload
-
-
-@dataclass(frozen=True, slots=True)
-class OptimizationJobSpec:
-    mode: str
-    run_id: str
-    token: str
-    mode_epoch: int
-    confirmation_generation: int
-    settings: Settings
-    baseline_development_run_id: str
-    train_cases: tuple[CaseRecord, ...]
-    validation_cases: tuple[CaseRecord, ...]
-    rules_text: str
-    runs_root: Path
-    programs_root: Path
-
-
-@dataclass(frozen=True, slots=True)
-class BenchmarkJobSpec:
-    mode: str
-    run_id: str
-    token: str
-    mode_epoch: int
-    confirmation_generation: int
-    settings: Settings
-    baseline_development_run_id: str
-    optimization_run_id: str
-    release_results: bool
-    runs_root: Path
-    programs_root: Path
-    test_cases: tuple[CaseRecord, ...] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PlaygroundJobSpec:
-    mode: str
-    run_id: str
-    token: str
-    mode_epoch: int
-    confirmation_generation: int
-    settings: Settings
-    optimization_run_id: str
-    title: str
-    article_text: str
-    product_facts: ProductFacts
-    sources: tuple[SourceRecord, ...]
-    retain_content: bool
-    runs_root: Path
-    programs_root: Path
-
-
-@dataclass
-class JobHandle:
-    """One in-process paid job; the worker never renders Streamlit."""
-
-    run_id: str
-    token_sha256: str
-    mode_epoch: int
-    runs_root: Path
-    programs_root: Path
-    settings: Settings
-    ledger: BudgetLedger
-    events_path: Path
-    started_at: str
-    baseline_development_run_id: str = ""
-    train_cases: tuple[CaseRecord, ...] = ()
-    validation_cases: tuple[CaseRecord, ...] = ()
-    rules_text: str = ""
-    job_kind: str = JOB_KIND_OPTIMIZATION
-    _lock: threading.RLock = field(
-        default_factory=threading.RLock, repr=False
-    )
-    _status: str = JOB_STATUS_RUNNING
-    _error: str | None = None
-    _finished_at: str | None = None
-    _result: object | None = None
-    _thread: threading.Thread | None = field(default=None, repr=False)
-
-    @property
-    def status(self) -> str:
-        with self._lock:
-            return self._status
-
-    @property
-    def error(self) -> str | None:
-        with self._lock:
-            return self._error
-
-    @property
-    def finished_at(self) -> str | None:
-        with self._lock:
-            return self._finished_at
-
-    @property
-    def result(self) -> object | None:
-        with self._lock:
-            return self._result
-
-    @property
-    def active(self) -> bool:
-        return self.status in JOB_ACTIVE_STATUSES
-
-    def request_cancel(self) -> bool:
-        with self._lock:
-            if self._status != JOB_STATUS_RUNNING:
-                return False
-            self._status = JOB_STATUS_CANCELLING
-        self.ledger.cancel("cancelled_by_operator")
-        return True
-
-    def finish(
-        self,
-        status: str,
-        *,
-        error: str | None = None,
-        result: object | None = None,
-    ) -> None:
-        with self._lock:
-            self._status = status
-            self._error = error
-            self._result = result
-            self._finished_at = _utc_now()
-
-    def read_events(
-        self, limit: int = 40
-    ) -> list[Mapping[str, object]]:
-        """Read persisted progress events only; never dispatch a request."""
-        try:
-            lines = self.events_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return []
-        events: list[Mapping[str, object]] = []
-        for line in lines[-max(1, limit) :]:
-            try:
-                payload = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(payload, Mapping):
-                events.append(payload)
-        return events
-
-    def budget_snapshot(self) -> BudgetSnapshot:
-        return self.ledger.snapshot()
-
-
-class JobManager:
-    """Single-worker coordinator, active-job lock, and consumed-token registry."""
-
-    def __init__(
-        self,
-        runs_root: Path,
-        programs_root: Path,
-        *,
-        runner: Callable[[object, JobHandle], object] | None = None,
-    ) -> None:
-        self._runs_root = Path(runs_root)
-        self._programs_root = Path(programs_root)
-        self._runner = runner or _run_paid_job
-        self._lock = threading.RLock()
-        self._handle: JobHandle | None = None
-        self._consumed_tokens: set[str] = set()
-        self._mode_epoch = 0
-        self._confirmation_generation = 0
-        self._last_mode: str | None = None
-        self._records: dict[str, dict[str, object]] = {}
-        self._registry_dir = self._runs_root / JOB_REGISTRY_DIRNAME
-        self._active_lock_path = (
-            self._registry_dir / ACTIVE_JOB_LOCK_FILENAME
-        )
-        self._registry_dir.mkdir(parents=True, exist_ok=True)
-        self._recover()
-
-    @property
-    def active_handle(self) -> JobHandle | None:
-        with self._lock:
-            handle = self._handle
-        return handle if handle is not None and handle.active else None
-
-    @property
-    def latest_handle(self) -> JobHandle | None:
-        with self._lock:
-            return self._handle
-
-    def latest_handle_for(self, kind: str) -> JobHandle | None:
-        with self._lock:
-            handle = self._handle
-        if handle is None or handle.job_kind != kind:
-            return None
-        return handle
-
-    @property
-    def mode_epoch(self) -> int:
-        with self._lock:
-            return self._mode_epoch
-
-    @property
-    def confirmation_generation(self) -> int:
-        with self._lock:
-            return self._confirmation_generation
-
-    def note_mode(self, mode: str) -> int:
-        with self._lock:
-            if self._last_mode is None:
-                self._last_mode = mode
-            elif mode != self._last_mode:
-                self._last_mode = mode
-                self._mode_epoch += 1
-            return self._mode_epoch
-
-    def start_job(self, spec: OptimizationJobSpec) -> JobHandle:
-        return self._start(
-            spec,
-            kind=JOB_KIND_OPTIMIZATION,
-            limits=spec.settings.optimization_budget(),
-            optimization_fields=spec,
-        )
-
-    def start_benchmark(self, spec: BenchmarkJobSpec) -> JobHandle:
-        return self._start(
-            spec,
-            kind=JOB_KIND_BENCHMARK,
-            limits=spec.settings.benchmark_budget(),
-        )
-
-    def start_playground(self, spec: PlaygroundJobSpec) -> JobHandle:
-        return self._start(
-            spec,
-            kind=JOB_KIND_PLAYGROUND,
-            limits=spec.settings.playground_budget(),
-        )
-
-    def _start(
-        self,
-        spec: object,
-        *,
-        kind: str,
-        limits: object,
-        optimization_fields: OptimizationJobSpec | None = None,
-    ) -> JobHandle:
-        mode = getattr(spec, "mode", None)
-        if mode != MODE_LIVE:
-            raise JobGateError(
-                f"paid {kind} can start only in Live Experiment"
-            )
-        settings = getattr(spec, "settings", None)
-        if not isinstance(settings, Settings):
-            raise JobGateError("a validated Live settings object is required")
-        token = getattr(spec, "token", None)
-        run_id = getattr(spec, "run_id", None)
-        if not isinstance(token, str) or not token.strip():
-            raise JobStaleError("a fresh confirmation token is required")
-        if (
-            not isinstance(run_id, str)
-            or JOB_RUN_ID_PATTERN.fullmatch(run_id) is None
-        ):
-            raise JobStaleError(f"invalid {kind} run ID")
-        token_hash = _token_sha256(token)
-        with self._lock:
-            if self._handle is not None and self._handle.active:
-                raise JobBusyError(
-                    "another Live job is already active"
-                )
-            if token_hash in self._consumed_tokens:
-                raise JobStaleError(
-                    "this confirmation was already consumed; confirm a new "
-                    "budget"
-                )
-            if getattr(spec, "mode_epoch", None) != self._mode_epoch:
-                raise JobStaleError(
-                    "the experiment mode changed after this form was "
-                    "prepared; review and confirm a fresh budget"
-                )
-            if (
-                getattr(spec, "confirmation_generation", None)
-                != self._confirmation_generation
-            ):
-                raise JobStaleError(
-                    "another confirmed job consumed this form generation; "
-                    "review and confirm a fresh budget"
-                )
-            if self._run_exists(run_id, kind):
-                raise JobStaleError(
-                    "this run ID already exists; a stale form cannot start "
-                    "another paid job"
-                )
-            if read_active_job_lock(self._runs_root) is not None:
-                raise JobBusyError(
-                    "another process holds the single active-job lock"
-                )
-            ledger = BudgetLedger.from_limits(limits)  # type: ignore[arg-type]
-            started_at = _utc_now()
-            handle = JobHandle(
-                run_id=run_id,
-                token_sha256=token_hash,
-                mode_epoch=int(getattr(spec, "mode_epoch", 0)),
-                runs_root=Path(getattr(spec, "runs_root")),
-                programs_root=Path(getattr(spec, "programs_root")),
-                settings=settings,
-                ledger=ledger,
-                events_path=(
-                    self._runs_root
-                    / JOB_FOLDERS[kind]
-                    / run_id
-                    / "events.jsonl"
-                ),
-                started_at=started_at,
-                job_kind=kind,
-                baseline_development_run_id=(
-                    optimization_fields.baseline_development_run_id
-                    if optimization_fields is not None
-                    else str(
-                        getattr(spec, "baseline_development_run_id", "") or ""
-                    )
-                ),
-                train_cases=(
-                    optimization_fields.train_cases
-                    if optimization_fields is not None
-                    else ()
-                ),
-                validation_cases=(
-                    optimization_fields.validation_cases
-                    if optimization_fields is not None
-                    else ()
-                ),
-                rules_text=(
-                    optimization_fields.rules_text
-                    if optimization_fields is not None
-                    else ""
-                ),
-            )
-            record = self._record_payload(spec, handle)
-            self._consumed_tokens.add(token_hash)
-            self._confirmation_generation += 1
-            self._handle = handle
-            self._records[run_id] = record
-            try:
-                self._write_record(record)
-                self._write_active_lock(run_id)
-                thread = threading.Thread(
-                    target=self._run_job,
-                    args=(spec, handle),
-                    name=f"dspy-{kind}-{run_id}",
-                    daemon=True,
-                )
-                handle._thread = thread
-                thread.start()
-            except JobBusyError:
-                handle.finish(
-                    JOB_STATUS_FAILED,
-                    error="another process holds the active-job lock",
-                )
-                self._complete_record(handle)
-                raise
-            except Exception as exc:  # noqa: BLE001 - worker start boundary
-                handle.finish(
-                    JOB_STATUS_FAILED,
-                    error=_redact_secret(
-                        f"worker start failed: {exc}",
-                        settings.openrouter_api_key,
-                    ),
-                )
-                self._complete_record(handle)
-                self._release_active_lock(run_id)
-                raise JobGateError(
-                    f"the {kind} worker could not start; no provider "
-                    "request was dispatched"
-                ) from exc
-            return handle
-
-    def request_cancel(self, run_id: str) -> bool:
-        with self._lock:
-            handle = self._handle
-        if handle is None or handle.run_id != run_id:
-            return False
-        return handle.request_cancel()
-
-    def recent_records(self, limit: int = 5) -> list[dict[str, object]]:
-        with self._lock:
-            records = [dict(record) for record in self._records.values()]
-        records.sort(
-            key=lambda record: str(
-                record.get("started_at") or record.get("created_at") or ""
-            ),
-            reverse=True,
-        )
-        return records[: max(1, limit)]
-
-    def _run_job(self, spec: object, handle: JobHandle) -> None:
-        try:
-            result = self._runner(spec, handle)
-        except Exception as exc:  # noqa: BLE001 - worker boundary
-            recovered = self._status_from_run(handle.job_kind, handle.run_id)
-            if recovered is None and handle.ledger.cancelled:
-                recovered = JOB_STATUS_STOPPED
-            handle.finish(
-                recovered or JOB_STATUS_FAILED,
-                error=_redact_secret(
-                    f"{type(exc).__name__}: {exc}",
-                    handle.settings.openrouter_api_key,
-                ),
-            )
-        else:
-            manifest = getattr(result, "manifest", None)
-            status = getattr(result, "status", None)
-            if status is None:
-                status = getattr(manifest, "status", JOB_STATUS_COMPLETED)
-            handle.finish(str(status), result=result)
-        finally:
-            try:
-                self._complete_record(handle)
-            finally:
-                self._release_active_lock(handle.run_id)
-
-    def _run_dir_for(self, kind: str, run_id: str) -> Path:
-        return self._runs_root / JOB_FOLDERS.get(kind, kind) / run_id
-
-    def _status_from_run(self, kind: str, run_id: str) -> str | None:
-        run_dir = self._run_dir_for(kind, run_id)
-        if kind == JOB_KIND_PLAYGROUND:
-            payload = _read_json_file(run_dir / "summary.json")
-            status = None if payload is None else payload.get("status")
-            return status if isinstance(status, str) else None
-        try:
-            manifest = read_run_manifest(run_dir)
-        except Exception:  # noqa: BLE001 - missing manifest is not fatal here
-            return None
-        return manifest.status
-
-    def _record_payload(
-        self, spec: object, handle: JobHandle
-    ) -> dict[str, object]:
-        settings = getattr(spec, "settings")
-        if handle.job_kind == JOB_KIND_OPTIMIZATION:
-            limits = settings.optimization_budget()
-        elif handle.job_kind == JOB_KIND_BENCHMARK:
-            limits = settings.benchmark_budget()
-        else:
-            limits = settings.playground_budget()
-        return {
-            "schema_version": JOB_SCHEMA_VERSION,
-            "run_id": handle.run_id,
-            "job_kind": handle.job_kind,
-            "token_sha256": handle.token_sha256,
-            "mode": MODE_LIVE,
-            "status": handle.status,
-            "pid": os.getpid(),
-            "process_instance_id": PROCESS_INSTANCE_ID,
-            "process_start_token": _process_start_token(os.getpid()),
-            "created_at": handle.started_at,
-            "started_at": handle.started_at,
-            "finished_at": None,
-            "error": None,
-            "stop_reason": None,
-            "baseline_development_run_id": getattr(
-                spec, "baseline_development_run_id", None
-            ),
-            "optimization_run_id": getattr(
-                spec, "optimization_run_id", None
-            ),
-            "max_calls": limits.max_calls,
-            "max_cost_usd": str(limits.max_cost_usd),
-        }
-
-    def _complete_record(self, handle: JobHandle) -> None:
-        with self._lock:
-            record = dict(self._records.get(handle.run_id, {}))
-            record.update(
-                {
-                    "status": handle.status,
-                    "finished_at": handle.finished_at,
-                    "error": handle.error,
-                    "stop_reason": handle.ledger.snapshot().stop_reason,
-                }
-            )
-            self._records[handle.run_id] = record
-            self._consumed_tokens.add(handle.token_sha256)
-            self._write_record(record)
-
-    def _run_exists(self, run_id: str, kind: str) -> bool:
-        if run_id in self._records:
-            return True
-        return self._run_dir_for(kind, run_id).exists()
-
-    def _write_record(self, record: Mapping[str, object]) -> None:
-        atomic_write_json(
-            self._registry_dir / f"{record['run_id']}.json", record
-        )
-
-    def _write_active_lock(self, run_id: str) -> None:
-        payload = {
-            "schema_version": JOB_SCHEMA_VERSION,
-            "run_id": run_id,
-            "pid": os.getpid(),
-            "process_instance_id": PROCESS_INSTANCE_ID,
-            "process_start_token": _process_start_token(os.getpid()),
-            "created_at": _utc_now(),
-        }
-        data = (
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-            + "\n"
-        ).encode("utf-8")
-        # The app is a single local process; this re-read narrows the
-        # stale-cleanup race. Cross-process exclusion is advisory
-        # defense-in-depth, backed by the job registry and run-ID checks.
-        for _attempt in (1, 2):
-            try:
-                descriptor = os.open(
-                    self._active_lock_path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                )
-            except FileExistsError as exc:
-                existing = _read_json_file(self._active_lock_path)
-                if existing is None:
-                    raise JobBusyError(
-                        "the active-job lock is unreadable; inspect it "
-                        "before starting another paid job"
-                    ) from exc
-                if _pid_alive(existing.get("pid")):
-                    raise JobBusyError(
-                        "another process holds the single active-job lock"
-                    ) from exc
-                current = _read_json_file(self._active_lock_path)
-                if current != existing:
-                    continue
-                try:
-                    self._active_lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as unlink_error:
-                    raise JobBusyError(
-                        "a stale active-job lock could not be cleared"
-                    ) from unlink_error
-                continue
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            return
-        raise JobBusyError(
-            "another process holds the single active-job lock"
-        )
-
-    def _release_active_lock(self, run_id: str) -> None:
-        payload = _read_json_file(self._active_lock_path)
-        if payload is not None and payload.get("run_id") == run_id:
-            try:
-                self._active_lock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    def _recover(self) -> None:
-        records: dict[str, dict[str, object]] = {}
-        for path in sorted(self._registry_dir.glob("*.json")):
-            payload = _read_json_file(path)
-            if payload is None:
-                continue
-            run_id = payload.get("run_id")
-            if not isinstance(run_id, str) or not run_id:
-                continue
-            record = dict(payload)
-            kind = record.get("job_kind")
-            if kind not in JOB_FOLDERS:
-                kind = JOB_KIND_OPTIMIZATION
-                record["job_kind"] = kind
-            records[run_id] = record
-            token_hash = record.get("token_sha256")
-            if isinstance(token_hash, str):
-                self._consumed_tokens.add(token_hash)
-            if record.get("status") != JOB_STATUS_RUNNING:
-                continue
-            pid = record.get("pid")
-            same_process_instance = (
-                pid == os.getpid()
-                and record.get("process_instance_id")
-                == PROCESS_INSTANCE_ID
-            )
-            if same_process_instance:
-                continue
-            if pid != os.getpid() and _pid_alive(pid):
-                recorded_start = record.get("process_start_token")
-                current_start = _process_start_token(pid)
-                if not (
-                    isinstance(recorded_start, str)
-                    and current_start is not None
-                    and recorded_start != current_start
-                ):
-                    continue
-            # Same PID with a different instance, or a reused PID with a
-            # different start token, is a restarted job with no live worker.
-            recovered_status = (
-                self._status_from_run(str(kind), run_id)
-                or JOB_STATUS_INTERRUPTED
-            )
-            record["status"] = recovered_status
-            record["finished_at"] = _utc_now()
-            if recovered_status == JOB_STATUS_INTERRUPTED:
-                record["error"] = (
-                    f"process restarted before the {kind} job finished"
-                )
-                record["stop_reason"] = "interrupted"
-                self._append_interrupted_event(run_id, str(kind))
-            self._records[run_id] = record
-            self._write_record(record)
-        self._records = records
-        lock_payload = _read_json_file(self._active_lock_path)
-        lock_stale_same_process = (
-            lock_payload is not None
-            and lock_payload.get("pid") == os.getpid()
-            and lock_payload.get("process_instance_id")
-            not in (None, PROCESS_INSTANCE_ID)
-        )
-        lock_process_reused = False
-        if lock_payload is not None:
-            recorded_start = lock_payload.get("process_start_token")
-            current_start = _process_start_token(lock_payload.get("pid"))
-            lock_process_reused = bool(
-                isinstance(recorded_start, str)
-                and current_start is not None
-                and recorded_start != current_start
-            )
-        if lock_payload is not None and (
-            not _pid_alive(lock_payload.get("pid"))
-            or lock_stale_same_process
-            or lock_process_reused
-        ):
-            try:
-                self._active_lock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    def _append_interrupted_event(self, run_id: str, kind: str) -> None:
-        run_dir = self._run_dir_for(kind, run_id)
-        if not run_dir.is_dir():
-            return
-        try:
-            append_jsonl(
-                run_dir / "events.jsonl",
-                {
-                    "at": _utc_now(),
-                    "event": "job_interrupted",
-                    "reason": "process_restart",
-                    "run_id": run_id,
-                },
-            )
-        except OSError:
-            pass
-
-
-def _run_paid_job(spec: object, handle: JobHandle) -> object:
-    """Dispatch one confirmed Live worker. Imports stay off the Replay path."""
-    if isinstance(spec, BenchmarkJobSpec):
-        return _run_benchmark_job(spec, handle)
-    if isinstance(spec, PlaygroundJobSpec):
-        return _run_playground_job(spec, handle)
-    return _run_optimization_job(spec, handle)  # type: ignore[arg-type]
-
-
-def _run_optimization_job(
-    spec: OptimizationJobSpec, handle: JobHandle
-) -> object:
-    """Default optimization worker body."""
-    from dspy_lab.experiments import run_optimization
-
-    return run_optimization(
-        spec.settings,
-        spec.train_cases,
-        spec.validation_cases,
-        baseline_development_run_id=spec.baseline_development_run_id,
-        confirm_budget=True,
-        run_id=spec.run_id,
-        origin="live",
-        runs_root=spec.runs_root,
-        programs_root=spec.programs_root,
-        rules_text=spec.rules_text,
-        ledger=handle.ledger,
-    )
-
-
-def _run_benchmark_job(
-    spec: BenchmarkJobSpec, handle: JobHandle
-) -> object:
-    """Load the sealed split only inside the authorized benchmark worker."""
-    from dspy_lab.experiments import (
-        load_benchmark_cases,
-        run_benchmark,
-    )
-    from dspy_lab.program import load_editorial_rules
-
-    test_cases = (
-        spec.test_cases
-        if spec.test_cases is not None
-        else tuple(load_benchmark_cases(DATA_DIR))
-    )
-    return run_benchmark(
-        spec.settings,
-        test_cases,
-        baseline_development_run_id=spec.baseline_development_run_id,
-        optimization_run_id=spec.optimization_run_id,
-        confirm_budget=True,
-        release_results=spec.release_results,
-        run_id=spec.run_id,
-        origin="live",
-        runs_root=spec.runs_root,
-        programs_root=spec.programs_root,
-        rules_text=load_editorial_rules(),
-        ledger=handle.ledger,
-    )
-
-
-def _run_playground_job(
-    spec: PlaygroundJobSpec, handle: JobHandle
-) -> object:
-    """Run both frozen artifacts without any gold-based scoring."""
-    from dspy_lab.experiments import run_playground
-
-    return run_playground(
-        spec.settings,
-        optimization_run_id=spec.optimization_run_id,
-        title=spec.title,
-        article_text=spec.article_text,
-        product_facts=spec.product_facts,
-        sources=spec.sources,
-        retain_content=spec.retain_content,
-        confirm_budget=True,
-        run_id=spec.run_id,
-        runs_root=spec.runs_root,
-        programs_root=spec.programs_root,
-        ledger=handle.ledger,
-    )
 
 
 _JOB_MANAGER_OVERRIDE: JobManager | None = None
@@ -1159,7 +655,7 @@ def _render_mode_selector(*, disabled: bool = False) -> str:
 
 
 def _resolve_replay_context() -> ReplayContext:
-    entries = list_run_directories(RUNS_ROOT, kind="benchmark")
+    entries = _run_directories("benchmark")
     if not entries:
         return ReplayContext(
             entries=(),
@@ -1186,11 +682,7 @@ def _resolve_replay_context() -> ReplayContext:
             error=selected.error or "archive manifest is unavailable",
         )
     try:
-        archive = open_replay_archive(
-            selected.run_dir,
-            runs_root=RUNS_ROOT,
-            programs_root=PROGRAMS_ROOT,
-        )
+        archive = _read_replay_archive(selected.run_dir)
     except ArtifactError as exc:
         return ReplayContext(
             entries=entries,
@@ -1220,9 +712,7 @@ def _resolve_live_context() -> LiveContext:
         settings = load_settings("live")
     except ConfigurationError as exc:
         config_error = str(exc)
-    development_entries = list_run_directories(
-        RUNS_ROOT, kind="development"
-    )
+    development_entries = _run_directories("development")
     selected_development: RunDirectoryEntry | None = None
     development: RecordedDevelopmentRun | None = None
     development_error: str | None = None
@@ -1248,21 +738,15 @@ def _resolve_live_context() -> LiveContext:
             )
         else:
             try:
-                development = open_development_run(
-                    selected_development.run_dir,
-                    runs_root=RUNS_ROOT,
-                    programs_root=PROGRAMS_ROOT,
+                development = _read_development_run(
+                    selected_development.run_dir
                 )
             except ArtifactError as exc:
                 development_error = str(exc)
             except Exception as exc:  # noqa: BLE001
                 development_error = f"{type(exc).__name__}: {exc}"
-    optimization_entries = list_run_directories(
-        RUNS_ROOT, kind="optimization"
-    )
-    benchmark_entries = list_run_directories(
-        RUNS_ROOT, kind="benchmark"
-    )
+    optimization_entries = _run_directories("optimization")
+    benchmark_entries = _run_directories("benchmark")
     return LiveContext(
         settings=settings,
         config_error=config_error,
@@ -1445,6 +929,8 @@ def _render_replay_optimization(archive: ReplayArchive) -> None:
         st.markdown(
             f"- **Stop reason:** {optimization.stop_reason}"
         )
+    if optimization.error_message is not None:
+        st.text(f"Recorded error: {optimization.error_message}")
     st.info(
         "Replay exposes no paid execution path. Candidate and reflection "
         "inspection is read-only; start a fresh confirmed optimization in "
@@ -1488,22 +974,7 @@ def _comparison_view_from_archive(
     )
 
 
-def _ratio(numerator: int, denominator: int) -> float | None:
-    if denominator == 0:
-        return None
-    return numerator / denominator
 
-
-def _metric_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
-def _metric_int(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
 
 
 def _rescore_outcome(
@@ -1514,23 +985,42 @@ def _rescore_outcome(
     This is deterministic local arithmetic over recorded findings and the
     archived gold case. It constructs no LM and makes no provider call.
     """
-    if outcome.status == "ok" and outcome.findings is not None:
-        return score_case(
-            case, EditorialQAOutput(findings=list(outcome.findings))
-        )
-    metric = outcome.metric if isinstance(outcome.metric, Mapping) else {}
-    kind = metric.get("error_kind")
-    if kind not in ("parse_error", "request_error", "missing_output"):
-        kind = "parse_error"
-    reason = (
-        outcome.error
-        or metric.get("error")
-        or "recorded invalid output"
-    )
-    return score_case(case, InvalidPrediction(str(reason), kind=kind))
+    return rescore_recorded_outcome(case, outcome)
+
+
+_COMPARISON_CACHE_LIMIT = 4
+_COMPARISON_CACHE: dict[
+    tuple[int, int],
+    tuple[tuple[CaseRecord, ...], tuple[RecordedOutcome, ...], dict],
+] = {}
+_COMPARISON_CACHE_LOCK = threading.Lock()
 
 
 def _comparison_recompute(
+    cases: Sequence[CaseRecord],
+    outcomes: Sequence[RecordedOutcome],
+) -> dict[str, dict[str, object]]:
+    """Return deterministic re-scores, reusing immutable archive tuples."""
+    if not isinstance(cases, tuple) or not isinstance(outcomes, tuple):
+        return _compute_comparison(cases, outcomes)
+    key = (id(cases), id(outcomes))
+    with _COMPARISON_CACHE_LOCK:
+        cached = _COMPARISON_CACHE.get(key)
+        if (
+            cached is not None
+            and cached[0] is cases
+            and cached[1] is outcomes
+        ):
+            return cached[2]
+    result = _compute_comparison(cases, outcomes)
+    with _COMPARISON_CACHE_LOCK:
+        if len(_COMPARISON_CACHE) >= _COMPARISON_CACHE_LIMIT:
+            _COMPARISON_CACHE.clear()
+        _COMPARISON_CACHE[key] = (cases, outcomes, result)
+    return result
+
+
+def _compute_comparison(
     cases: Sequence[CaseRecord],
     outcomes: Sequence[RecordedOutcome],
 ) -> dict[str, dict[str, object]]:
@@ -1606,8 +1096,6 @@ def _comparison_recompute(
             cost_status = "estimated"
         elif "actual" in cost_statuses:
             cost_status = "actual"
-        elif costs:
-            cost_status = "none"
         else:
             cost_status = "none"
         if cost_status in ("pending", "unavailable"):
@@ -1791,51 +1279,14 @@ def _comparison_delta_warnings(
     return warnings
 
 
-def _rate_text(value: object) -> str:
-    number = _metric_number(value)
-    if number is None:
-        return "N/A"
-    return f"{number * 100:.1f}%"
 
 
-def _rate_delta_text(baseline: object, optimized: object) -> str:
-    left = _metric_number(baseline)
-    right = _metric_number(optimized)
-    if left is None or right is None:
-        return "N/A"
-    return f"{(right - left) * 100:+.1f} pp"
 
 
-def _count_delta_text(baseline: object, optimized: object) -> str:
-    left = _metric_int(baseline)
-    right = _metric_int(optimized)
-    if left is None or right is None:
-        return "N/A"
-    return f"{right - left:+d}"
 
 
-def _number_delta_text(baseline: object, optimized: object) -> str:
-    left = _metric_number(baseline)
-    right = _metric_number(optimized)
-    if left is None or right is None:
-        return "N/A"
-    return f"{right - left:+.4f}"
 
 
-def _money_text(value: object, status: object) -> str:
-    if value is None:
-        return f"unavailable ({status or 'unknown'})"
-    return f"{value} USD ({status or 'unknown status'})"
-
-
-def _comparison_effective(
-    stored_arm: Mapping[str, object] | None,
-    recomputed_arm: Mapping[str, object],
-    key: str,
-) -> object:
-    if isinstance(stored_arm, Mapping) and key in stored_arm:
-        return stored_arm.get(key)
-    return recomputed_arm.get(key)
 
 
 def _render_comparison_screen(view: ComparisonView) -> None:
@@ -2067,7 +1518,7 @@ def _render_comparison_screen(view: ComparisonView) -> None:
         f"| Cost / article | "
         f"{_money_text(base.get('cost_per_article_usd'), base.get('cost_status'))} | "
         f"{_money_text(opt.get('cost_per_article_usd'), opt.get('cost_status'))} | "
-        f"{_number_delta_text(_metric_number(base.get('cost_per_article_usd')), _metric_number(opt.get('cost_per_article_usd')))} USD |\n"
+        f"{_money_delta_text(base.get('cost_per_article_usd'), opt.get('cost_per_article_usd'))} USD |\n"
         f"| Latency median | {_latency(base.get('latency_median_ms'))} | "
         f"{_latency(opt.get('latency_median_ms'))} | "
         f"{_number_delta_text(_metric_number(base.get('latency_median_ms')), _metric_number(opt.get('latency_median_ms')))} ms |\n"
@@ -2076,9 +1527,9 @@ def _render_comparison_screen(view: ComparisonView) -> None:
         f"{_latency(opt.get('latency_p95_ms'))} | "
         f"{_number_delta_text(_metric_number(base.get('latency_p95_ms')), _metric_number(opt.get('latency_p95_ms')))} ms |\n"
         f"| DSPy Evaluate mean | "
-        f"{_rate_text(base.get('evaluate_percent_mean'))} | "
-        f"{_rate_text(opt.get('evaluate_percent_mean'))} | "
-        f"{_rate_delta_text(base.get('evaluate_percent_mean'), opt.get('evaluate_percent_mean'))} |"
+        f"{_percent_text(base.get('evaluate_percent_mean'))} | "
+        f"{_percent_text(opt.get('evaluate_percent_mean'))} | "
+        f"{_percent_delta_text(base.get('evaluate_percent_mean'), opt.get('evaluate_percent_mean'))} |"
     )
     st.caption(
         "The DSPy Evaluate row is the evaluator's rounded per-case mean and "
@@ -2615,11 +2066,7 @@ def _render_live_comparison(
             )
         else:
             try:
-                archive = open_replay_archive(
-                    entry.run_dir,
-                    runs_root=RUNS_ROOT,
-                    programs_root=PROGRAMS_ROOT,
-                )
+                archive = _read_replay_archive(entry.run_dir)
             except ArtifactError as exc:
                 st.error(
                     "The selected benchmark archive cannot be read: "
@@ -2696,6 +2143,106 @@ def _parse_playground_json(
     return facts, sources, None
 
 
+def _render_recorded_playgrounds() -> None:
+    entries = _run_directories("playground")
+    readable = [entry for entry in entries if entry.manifest is not None]
+    if not readable:
+        return
+    with st.expander("Recorded playground runs", expanded=False):
+        labels = [_run_entry_label(entry) for entry in readable]
+        selected_label = st.selectbox(
+            "Recorded playground run",
+            labels,
+            index=0,
+            key="playground_recorded_run",
+        )
+        try:
+            entry = readable[labels.index(selected_label)]
+        except ValueError:
+            entry = readable[0]
+        if entry.manifest is None:
+            st.error(entry.error or "playground manifest is unavailable")
+            return
+        try:
+            run = _read_playground_run(entry.run_dir)
+        except ArtifactError as exc:
+            st.error(f"Recorded playground run cannot be read: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - read-only UI
+            st.error(
+                "Recorded playground run cannot be read: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        summary = run.summary
+        st.markdown(
+            f"- **Run:** `{run.manifest.run_id}`\n"
+            f"- **Status / origin:** {run.manifest.status} / "
+            f"{run.manifest.origin}\n"
+            f"- **Created / finished (UTC):** {run.manifest.created_at} / "
+            f"{run.manifest.finished_at or 'not finished'}\n"
+            f"- **Content retained:** "
+            f"{'yes' if summary.get('retain_content') else 'no'}\n"
+            f"- **Additional provider calls by viewing:** 0"
+        )
+        for warning in run.warnings:
+            st.warning(warning)
+        arms = summary.get("arms")
+        if not isinstance(arms, Mapping):
+            st.error("The archived playground summary has no arm records.")
+            return
+        for arm, label in (
+            ("baseline", "Baseline"),
+            ("optimized", "Optimized"),
+        ):
+            payload = arms.get(arm)
+            st.markdown(f"**{label} arm**")
+            if not isinstance(payload, Mapping):
+                st.error("No archived arm record exists.")
+                continue
+            st.markdown(
+                f"- **Program ID:** `{payload.get('program_id', 'unknown')}`\n"
+                f"- **Status:** {payload.get('status', 'unknown')}\n"
+                f"- **Latency:** {_latency(payload.get('latency_ms'))}\n"
+                f"- **Recorded cost:** "
+                f"{_money_text(payload.get('cost_usd'), payload.get('cost_status'))}\n"
+                f"- **Input / output tokens:** "
+                f"{payload.get('input_tokens', 'unknown')} / "
+                f"{payload.get('output_tokens', 'unknown')}\n"
+                f"- **Request IDs:** "
+                f"{', '.join(str(item) for item in payload.get('request_ids') or []) or 'none'}"
+            )
+            raw_findings = payload.get("findings")
+            if isinstance(raw_findings, list):
+                try:
+                    findings = [
+                        Finding.model_validate(item)
+                        for item in raw_findings
+                    ]
+                except Exception as exc:  # noqa: BLE001 - archived payload
+                    st.error(f"Archived findings are invalid: {exc}")
+                else:
+                    _render_findings(findings)
+            elif payload.get("status") == "ok":
+                st.warning(
+                    "This run did not retain findings; only its status and "
+                    "economics are available."
+                )
+            error = payload.get("error")
+            if error:
+                st.error(f"Recorded error: {error}")
+            request_ids = payload.get("request_ids")
+            if isinstance(request_ids, list):
+                for request_id in request_ids:
+                    request = run.requests.get(str(request_id))
+                    if request is not None:
+                        _render_sent_request(request)
+        if summary.get("stop_reason"):
+            st.markdown(
+                f"- **Stop reason:** {summary.get('stop_reason')}"
+            )
+
+
 def _render_live_playground(
     context: LiveContext, manager: JobManager
 ) -> None:
@@ -2730,6 +2277,7 @@ def _render_live_playground(
         and st.session_state.get("play_started_run_id") == latest.run_id
     ):
         _render_finished_job(latest, cancel_label="Cancel playground")
+    _render_recorded_playgrounds()
     settings = context.settings
     if settings is None:
         st.warning(
@@ -3311,10 +2859,7 @@ def _render_optimization_confirmation(
     assert settings is not None
     assert development is not None
     try:
-        split = load_optimization_cases(
-            DATA_DIR / "train.jsonl",
-            DATA_DIR / "validation.jsonl",
-        )
+        split = _read_optimization_cases()
     except Exception as exc:  # noqa: BLE001 - explicit UI gap
         st.error(f"Optimization inputs are unavailable: {exc}")
         return
@@ -4058,11 +3603,7 @@ def _inspector_view_from_live(context: LiveContext) -> InspectorView:
             )
         else:
             try:
-                optimization = open_optimization_run(
-                    opt_entry.run_dir,
-                    runs_root=RUNS_ROOT,
-                    programs_root=PROGRAMS_ROOT,
-                )
+                optimization = _read_optimization_run(opt_entry.run_dir)
             except ArtifactError as exc:
                 warnings.append(
                     f"Optimization run cannot be read: {exc}"
@@ -4415,70 +3956,9 @@ def _render_preview(
 def _candidate_records(
     stats: Mapping[str, object] | None,
 ) -> tuple[list[dict[str, object]], str | None]:
-    if not isinstance(stats, Mapping):
-        return [], "No candidate statistics are archived."
-    detailed = stats.get("detailed_results")
-    if not isinstance(detailed, Mapping):
-        return [], "Candidate statistics do not contain detailed_results."
-    candidates = detailed.get("candidates")
-    if not isinstance(candidates, list):
-        return [], "Candidate statistics do not contain a candidate list."
-    scores = detailed.get("val_aggregate_scores")
-    best_idx = detailed.get("best_idx")
-    records: list[dict[str, object]] = []
-    for index, candidate in enumerate(candidates):
-        if not isinstance(candidate, Mapping):
-            continue
-        instruction = candidate.get("predict")
-        if not isinstance(instruction, str) or not instruction.strip():
-            nested = candidate.get("instructions")
-            if isinstance(nested, Mapping):
-                instruction = nested.get("predict")
-        if not isinstance(instruction, str) or not instruction.strip():
-            continue
-        score = (
-            scores[index]
-            if isinstance(scores, list) and index < len(scores)
-            else None
-        )
-        records.append(
-            {
-                "candidate_index": index,
-                "instructions": instruction,
-                "val_aggregate_score": score,
-                "selected": index == best_idx,
-            }
-        )
-    if not records:
-        return [], "Candidate statistics contain no inspectable instructions."
-    return records, None
+    return inspectable_candidate_records(stats)
 
 
-def _same_schema(
-    left: ProgramManifest, right: ProgramManifest
-) -> bool:
-    return (
-        left.signature_schema == right.signature_schema
-        and left.signature_fields == right.signature_fields
-    )
-
-
-def _unified_diff(
-    before: str,
-    after: str,
-    *,
-    fromfile: str,
-    tofile: str,
-) -> str:
-    return "\n".join(
-        difflib.unified_diff(
-            before.splitlines(),
-            after.splitlines(),
-            fromfile=fromfile,
-            tofile=tofile,
-            lineterm="",
-        )
-    )
 
 
 def _render_historical_costs(summary: Mapping[str, object]) -> None:
@@ -4505,95 +3985,13 @@ def _render_historical_costs(summary: Mapping[str, object]) -> None:
     )
 
 
-def _cost_value(value: object, status: object) -> str:
-    if value is None:
-        return f"unavailable ({status or 'unknown status'})"
-    return f"{value} USD ({status or 'unknown status'})"
 
 
-def _cost_status_from_payload(payload: Mapping[str, object]) -> str:
-    if "actual_cost_usd" in payload or "estimated_cost_usd" in payload:
-        unresolved = _decimal_or_none(payload.get("unresolved_cost_usd"))
-        if payload.get("pending_cost_calls") or (
-            unresolved is not None and unresolved > 0
-        ):
-            return "pending"
-        actual = _decimal_or_none(payload.get("actual_cost_usd"))
-        estimated = _decimal_or_none(payload.get("estimated_cost_usd"))
-        committed = _decimal_or_none(payload.get("committed_cost_usd"))
-        if actual is not None and actual > 0:
-            return "actual"
-        if estimated is not None and estimated > 0:
-            return "estimated"
-        if committed is not None and committed > 0:
-            return "committed"
-        return "none"
-    return str(payload.get("cost_status", "unavailable"))
 
 
-def _decimal_or_none(value: object) -> Decimal | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        decimal = Decimal(str(value))
-    except Exception:  # noqa: BLE001 - display fallback
-        return None
-    return decimal if decimal.is_finite() else None
 
 
-def _outcome_cost(outcome: RecordedOutcome) -> str:
-    if outcome.cost_usd is None:
-        return f"unavailable ({outcome.cost_status})"
-    return f"{outcome.cost_usd} USD ({outcome.cost_status})"
 
-
-def _percent(value: object) -> str:
-    if value is None or isinstance(value, bool):
-        return "N/A"
-    if isinstance(value, (int, float)):
-        return f"{float(value) * 100:.1f}%"
-    return "N/A"
-
-
-def _number(value: object) -> str:
-    if value is None or isinstance(value, bool):
-        return "N/A"
-    if isinstance(value, (int, float)):
-        number = float(value)
-        text = f"{number:.4f}".rstrip("0").rstrip(".")
-        if number != 0.0 and text in ("0", "-0"):
-            return f"{number:.6g}"
-        return text
-    if isinstance(value, Decimal):
-        return format(value, "f")
-    return str(value)
-
-
-def _int_value(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return 0
-    return value
-
-
-def _latency(value: float | None) -> str:
-    if value is None:
-        return "not recorded"
-    return f"{value:.1f} ms"
-
-
-def _message_content(content: object) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, Mapping):
-                text = part.get("text")
-                parts.append(str(text) if text is not None else str(part))
-            else:
-                parts.append(str(part))
-        return "\n".join(parts)
-    return json.dumps(content, ensure_ascii=False, indent=2, default=str)
 
 
 if __name__ == "__main__":

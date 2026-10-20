@@ -29,6 +29,7 @@ import dspy
 from pydantic import BaseModel
 from dspy.utils.exceptions import AdapterParseError
 
+from .artifacts import append_jsonl
 from .config import (
     PREFLIGHT_CALLS,
     PREFLIGHT_OUTPUT_DIR,
@@ -369,6 +370,7 @@ def run_preflight(
         f"{uuid4().hex[:8]}"
     )
     record_path = destination / f"{run_id}.json"
+    durable_requests_path = destination / f"{run_id}.requests.jsonl"
     checks: list[dict[str, object]] = []
     warnings: list[str] = []
     record: dict[str, object] = {
@@ -493,11 +495,23 @@ def run_preflight(
             for case, kind in selected
         ]
 
+        def persist_request(record: RequestRecord) -> None:
+            append_jsonl(
+                durable_requests_path,
+                _json_safe(_request_record_dict(record)),
+            )
+
         task_lm = build_guarded_lm(
-            settings, role="task", ledger=ledger
+            settings,
+            role="task",
+            ledger=ledger,
+            record_listener=persist_request,
         )
         reflection_lm = build_guarded_lm(
-            settings, role="reflection", ledger=ledger
+            settings,
+            role="reflection",
+            ledger=ledger,
+            record_listener=persist_request,
         )
         add_check(
             "ledger.shared",
@@ -509,14 +523,14 @@ def run_preflight(
         task_results: list[dict[str, object]] = []
         with dspy.context(lm=task_lm, adapter=StrictJSONAdapter()):
             for case, kind in selected:
-                before = len(ledger.records)
+                before = ledger.record_count
                 try:
                     prediction = program(**case_inputs(case, rules))
                 except AdapterParseError as exc:
                     raise PreflightError(
                         f"{case.case_id}: strict task parse failed: {exc}"
                     ) from exc
-                new_records = ledger.records[before:]
+                new_records = ledger.records_since(before)
                 add_check(
                     f"{case.case_id}.exactly_one_request",
                     len(new_records) == 1,
@@ -564,7 +578,7 @@ def run_preflight(
                 )
                 record["task_results"] = list(task_results)
 
-        before = len(ledger.records)
+        before = ledger.record_count
         with dspy.context(lm=reflection_lm, adapter=dspy.JSONAdapter()):
             reflection_prediction = dspy.Predict(
                 PreflightReflectionSignature
@@ -577,7 +591,7 @@ def run_preflight(
                     "max_tokens": PREFLIGHT_REFLECTION_MAX_TOKENS,
                 },
             )
-        new_records = ledger.records[before:]
+        new_records = ledger.records_since(before)
         add_check(
             "reflection.exactly_one_request",
             len(new_records) == 1,
@@ -646,6 +660,10 @@ def run_preflight(
         safe_record = _json_safe(record)
         try:
             _write_record(record_path, safe_record)
+            try:
+                durable_requests_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         except OSError as exc:
             persistence_error = PreflightError(
                 f"could not persist preflight record: {exc}"

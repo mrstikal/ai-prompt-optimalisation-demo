@@ -22,6 +22,14 @@ from uuid import uuid4
 
 import dspy
 from dspy.clients.legacy_requests import _strict_json_schema
+from dspy.utils.exceptions import (
+    LMAuthError,
+    LMBillingError,
+    LMConfigurationError,
+    LMInvalidRequestError,
+    LMUnsupportedFeatureError,
+    LMUnsupportedModelError,
+)
 from pydantic import BaseModel
 
 from .config import (
@@ -42,7 +50,14 @@ RequestStatus = Literal[
     "reconciled",
 ]
 CostStatus = Literal["none", "estimated", "actual", "pending"]
-StopReason = Literal["call_cap", "cost_cap", "cancelled", "overrun"]
+StopReason = Literal[
+    "call_cap",
+    "cost_cap",
+    "cancelled",
+    "overrun",
+    "fatal_provider_error",
+]
+_FATAL_PROVIDER_STATUSES = frozenset({401, 402, 403})
 
 _MILLION = Decimal(1_000_000)
 _SECRET_KEY_NAMES = {
@@ -83,6 +98,55 @@ class BudgetConfigurationError(ValueError):
 
 class BudgetLedgerError(RuntimeError):
     """Raised when a ledger transition is invalid."""
+
+
+_FATAL_PROVIDER_ERROR_TYPES = (
+    LMAuthError,
+    LMBillingError,
+    LMConfigurationError,
+    LMUnsupportedFeatureError,
+    LMUnsupportedModelError,
+)
+_FATAL_INVALID_REQUEST_MARKERS = (
+    "unsupported parameter",
+    "unsupported_parameter",
+    "not support",
+    "response_format",
+    "structured output",
+    "structured_outputs",
+    "json schema",
+    "json_schema",
+)
+
+
+def is_fatal_provider_error(exc: BaseException) -> bool:
+    """Classify deterministic provider/account failures that must stop a phase.
+
+    Authentication, billing/credit, permission, unsupported parameter/schema,
+    and unsupported-model responses cannot succeed by repeating the same
+    request. Generic invalid-request 400s (content policy, context length, or
+    malformed per-case input) are deliberately non-fatal so one bad case does
+    not terminate a phase. Rate limits, transport failures, timeouts, and
+    server errors are likewise excluded.
+    """
+    if isinstance(exc, _FATAL_PROVIDER_ERROR_TYPES):
+        return True
+    if isinstance(exc, LMInvalidRequestError):
+        message = str(exc).lower()
+        if any(
+            marker in message
+            for marker in _FATAL_INVALID_REQUEST_MARKERS
+        ):
+            return True
+    for name in ("status", "status_code"):
+        status = getattr(exc, name, None)
+        if (
+            isinstance(status, int)
+            and not isinstance(status, bool)
+            and status in _FATAL_PROVIDER_STATUSES
+        ):
+            return True
+    return False
 
 
 def _to_decimal(value: object, *, field_name: str) -> Decimal:
@@ -647,6 +711,7 @@ class BudgetLedger:
         self._max_cost = max_cost
         self._lock = threading.Lock()
         self._records: list[_RequestState] = []
+        self._record_index: dict[str, int] = {}
         self._next_sequence = 1
         self._admitted = 0
         self._delegated = 0
@@ -732,12 +797,7 @@ class BudgetLedger:
                 raise BudgetExceeded(
                     "call_cap", self._snapshot_locked()
                 )
-            pending_total = (
-                self._estimated
-                + self._actual
-                + self._unresolved
-                + reservation
-            )
+            pending_total = self._total_cost_locked() + reservation
             if pending_total > self._max_cost:
                 self._stop_reason = "cost_cap"
                 self._rejected += 1
@@ -776,6 +836,7 @@ class BudgetLedger:
                 response_text=None,
             )
             self._next_sequence += 1
+            self._record_index[state.call_id] = len(self._records)
             self._records.append(state)
             return Reservation(state.call_id, reservation)
 
@@ -825,7 +886,10 @@ class BudgetLedger:
                 state.cost_status = "pending"
                 self._pending += 1
                 return
-            self._unresolved -= state.reserved_cost_usd
+            # The in-band amount is only an estimate. Keep the conservative
+            # reservation unresolved until reconcile() records the actual
+            # charge; otherwise a low estimate would free spend headroom that
+            # has not been proven unused.
             self._estimated += cost
             state.status = "succeeded"
             state.cost_status = "estimated"
@@ -834,7 +898,13 @@ class BudgetLedger:
             self._succeeded += 1
             self._check_overrun_locked()
 
-    def fail(self, call_id: str, *, error: str) -> None:
+    def fail(
+        self,
+        call_id: str,
+        *,
+        error: str,
+        fatal: bool = False,
+    ) -> None:
         with self._lock:
             state = self._find_locked(call_id)
             if state.status not in ("admitted", "in_flight"):
@@ -847,6 +917,8 @@ class BudgetLedger:
             state.finished_at = datetime.now(timezone.utc)
             self._failed += 1
             self._pending += 1
+            if fatal and self._stop_reason is None:
+                self._stop_reason = "fatal_provider_error"
 
     def mark_pending(self, call_id: str, *, error: str) -> None:
         with self._lock:
@@ -898,6 +970,7 @@ class BudgetLedger:
             elif state.cost_status == "estimated":
                 if state.reported_cost_usd is not None:
                     self._estimated -= state.reported_cost_usd
+                self._unresolved -= state.reserved_cost_usd
             else:
                 raise BudgetLedgerError(
                     f"{call_id}: cannot reconcile from "
@@ -933,18 +1006,36 @@ class BudgetLedger:
 
     @property
     def records(self) -> tuple[RequestRecord, ...]:
+        return self.records_since(0)
+
+    @property
+    def record_count(self) -> int:
+        """Number of admitted attempts without copying their payloads."""
         with self._lock:
-            return tuple(state.freeze() for state in self._records)
+            return len(self._records)
+
+    def records_since(self, start: int = 0) -> tuple[RequestRecord, ...]:
+        """Freeze only records admitted at or after ``start``."""
+        with self._lock:
+            if isinstance(start, bool) or not isinstance(start, int):
+                raise BudgetLedgerError("record start must be an integer")
+            if start < 0 or start > len(self._records):
+                raise BudgetLedgerError(
+                    f"record start {start} is outside 0..{len(self._records)}"
+                )
+            return tuple(
+                state.freeze() for state in self._records[start:]
+            )
 
     def record(self, call_id: str) -> RequestRecord:
         with self._lock:
             return self._find_locked(call_id).freeze()
 
     def _find_locked(self, call_id: str) -> _RequestState:
-        for state in self._records:
-            if state.call_id == call_id:
-                return state
-        raise BudgetLedgerError(f"unknown call_id {call_id!r}")
+        index = self._record_index.get(call_id)
+        if index is None:
+            raise BudgetLedgerError(f"unknown call_id {call_id!r}")
+        return self._records[index]
 
     def _attach_response_locked(
         self,
@@ -974,8 +1065,29 @@ class BudgetLedger:
             state.usage = copy.deepcopy(dict(usage))
         state.finished_at = datetime.now(timezone.utc)
 
+    def _total_cost_locked(self) -> Decimal:
+        """Return the conservative upper bound still chargeable.
+
+        Every outstanding reservation remains counted until reconciliation or
+        release. For estimated completions the larger of the reservation and
+        the reported estimate is used, so an understated in-band cost cannot
+        free spend headroom while avoiding double-counting the same attempt.
+        """
+        total = self._actual
+        for state in self._records:
+            if state.status in ("released", "reconciled"):
+                continue
+            bound = state.reserved_cost_usd
+            if (
+                state.estimated_cost_usd is not None
+                and state.estimated_cost_usd > bound
+            ):
+                bound = state.estimated_cost_usd
+            total += bound
+        return total
+
     def _check_overrun_locked(self) -> None:
-        total = self._estimated + self._actual + self._unresolved
+        total = self._total_cost_locked()
         if total > self._max_cost:
             self._overrun = True
             if self._stop_reason is None:
@@ -983,7 +1095,7 @@ class BudgetLedger:
 
     def _snapshot_locked(self) -> BudgetSnapshot:
         committed = self._estimated + self._actual
-        total = committed + self._unresolved
+        total = self._total_cost_locked()
         exhausted = (
             self._stop_reason in ("call_cap", "cost_cap", "overrun")
             or self._admitted >= self._max_calls
@@ -1279,17 +1391,38 @@ class GuardedLM(dspy.LM):
             messages=self._recorded_messages(prompt, messages),
             request_kwargs=self._recorded_request_kwargs(delegated),
         )
+        try:
+            # Durably persist admission before any transport attempt. A crash
+            # during inference must not lose the attempt/reservation record.
+            self._notify(reservation.call_id)
+        except BaseException:
+            self._ledger.release(
+                reservation.call_id,
+                reason="admission persistence failed",
+            )
+            raise
         if self._ledger.cancelled:
             self._ledger.release(
                 reservation.call_id,
                 reason="cancelled before dispatch",
             )
-            self._notify(reservation.call_id)
+            try:
+                self._notify(reservation.call_id)
+            except Exception:
+                pass
             raise BudgetCancelled(
                 "budget cancelled before dispatch",
                 self._ledger.snapshot(),
             )
         self._ledger.mark_in_flight(reservation.call_id)
+        try:
+            self._notify(reservation.call_id)
+        except BaseException:
+            self._ledger.fail(
+                reservation.call_id,
+                error="in-flight persistence failed",
+            )
+            raise
         with self._call_lock:
             before = len(self.history)
             try:
@@ -1302,15 +1435,25 @@ class GuardedLM(dspy.LM):
                 self._ledger.fail(
                     reservation.call_id,
                     error=error,
+                    fatal=is_fatal_provider_error(exc),
                 )
-                self._notify(reservation.call_id)
+                try:
+                    self._notify(reservation.call_id)
+                except Exception as notify_exc:
+                    exc.add_note(
+                        "could not persist request failure: "
+                        f"{type(notify_exc).__name__}: {notify_exc}"
+                    )
                 raise
             if len(self.history) <= before:
                 self._ledger.mark_pending(
                     reservation.call_id,
                     error="no LM history record was produced",
                 )
-                self._notify(reservation.call_id)
+                try:
+                    self._notify(reservation.call_id)
+                except Exception:
+                    pass
                 return result
             record = self.history[-1]
             usage = record.get("usage") or {}
@@ -1333,7 +1476,10 @@ class GuardedLM(dspy.LM):
                 usage=usage,
                 response_text=self._response_text(result),
             )
-            self._notify(reservation.call_id)
+            try:
+                self._notify(reservation.call_id)
+            except Exception:
+                pass
             return result
 
     def _notify(self, call_id: str) -> None:
@@ -1634,6 +1780,7 @@ __all__ = [
     "StopReason",
     "build_guarded_lm",
     "conservative_token_counter",
+    "is_fatal_provider_error",
     "model_route_for",
     "openrouter_provider_options",
     "sanitize_request_kwargs",

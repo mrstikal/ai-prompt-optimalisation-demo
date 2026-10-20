@@ -167,6 +167,10 @@ def test_exact_call_cap_and_no_unreserved_dispatch(monkeypatch) -> None:
     assert snapshot.exhausted is True
     assert snapshot.stop_reason == "call_cap"
     assert len(ledger.records) == 2
+    assert ledger.record_count == 2
+    assert len(ledger.records_since(1)) == 1
+    with pytest.raises(BudgetLedgerError):
+        ledger.records_since(3)
 
 
 def test_cost_boundary_is_inclusive(monkeypatch) -> None:
@@ -178,7 +182,7 @@ def test_cost_boundary_is_inclusive(monkeypatch) -> None:
     assert lm("first") == ["ok"]
     snapshot = ledger.snapshot()
     assert snapshot.committed_cost_usd == BIG_RESERVATION
-    assert snapshot.unresolved_cost_usd == Decimal("0")
+    assert snapshot.unresolved_cost_usd == BIG_RESERVATION
     with pytest.raises(BudgetExceeded) as exc_info:
         lm("second")
     assert exc_info.value.reason == "cost_cap"
@@ -566,7 +570,7 @@ def test_request_record_usage_generation_and_cost(
     snapshot = ledger.snapshot()
     assert snapshot.estimated_cost_usd == Decimal("0.000123")
     assert snapshot.actual_cost_usd == Decimal("0")
-    assert snapshot.unresolved_cost_usd == Decimal("0")
+    assert snapshot.unresolved_cost_usd == RESERVATION
     assert snapshot.response_calls == 1
 
 
@@ -1094,3 +1098,98 @@ def test_validate_provider_options_accepts_only_the_exact_pin() -> None:
     assert validate_provider_options(routing, provider=PROVIDER) == routing
     with pytest.raises(BudgetConfigurationError):
         validate_provider_options([], provider=PROVIDER)
+
+def test_estimated_cost_keeps_reservation_until_reconciled(
+    monkeypatch,
+) -> None:
+    ledger = make_ledger(
+        max_calls=3, max_cost_usd=RESERVATION + RESERVATION
+    )
+    lm = make_lm(ledger)
+    calls = install_transport(monkeypatch, [Reply(cost=0.00001), Reply("ok")])
+    assert lm("first") == ["ok"]
+    record = ledger.records[0]
+    assert record.cost_status == "estimated"
+    assert ledger.snapshot().unresolved_cost_usd == RESERVATION
+    # The remaining budget still admits exactly one more reserved call; the
+    # estimate did not release the conservative reservation early.
+    assert lm("second") == ["ok"]
+    assert len(calls) == 2
+    with pytest.raises(BudgetExceeded):
+        lm("third")
+
+
+def test_fatal_provider_error_sets_terminal_stop(monkeypatch) -> None:
+    from dspy.utils.exceptions import LMAuthError
+
+    ledger = make_ledger(max_calls=5)
+    lm = make_lm(ledger)
+    calls = install_transport(
+        monkeypatch, [LMAuthError("invalid api key", status=401)]
+    )
+    with pytest.raises(LMAuthError):
+        lm("first")
+    snapshot = ledger.snapshot()
+    assert snapshot.stop_reason == "fatal_provider_error"
+    with pytest.raises(BudgetExceeded) as exc_info:
+        lm("second")
+    assert exc_info.value.reason == "fatal_provider_error"
+    assert len(calls) == 1
+
+
+def test_admission_is_persisted_before_transport(monkeypatch) -> None:
+    observed: list[tuple[str, str]] = []
+
+    def listener(record) -> None:
+        observed.append((record.status, record.cost_status))
+
+    ledger = make_ledger(max_calls=1)
+    lm = make_lm(ledger, record_listener=listener)
+
+    def fake_completion(*, request, num_retries=0):
+        assert observed
+        assert observed[0] == ("admitted", "none")
+        return response_for(Reply("ok"), request)
+
+    monkeypatch.setattr(
+        dspy_lm, "litellm_completion", fake_completion
+    )
+    assert lm("x") == ["ok"]
+    assert [status for status, _ in observed][:2] == [
+        "admitted",
+        "in_flight",
+    ]
+
+
+
+def test_fatal_classification_excludes_generic_invalid_requests() -> None:
+    from dspy.utils.exceptions import (
+        LMInvalidRequestError,
+        LMUnsupportedFeatureError,
+    )
+    from dspy_lab.llm import is_fatal_provider_error
+
+    assert is_fatal_provider_error(
+        LMInvalidRequestError("unsupported parameter: temperature", status=400)
+    )
+    assert is_fatal_provider_error(
+        LMUnsupportedFeatureError("structured outputs unavailable", status=400)
+    )
+    assert not is_fatal_provider_error(
+        LMInvalidRequestError("content policy violation", status=400)
+    )
+    assert not is_fatal_provider_error(
+        LMInvalidRequestError("maximum context length exceeded", status=400)
+    )
+    assert is_fatal_provider_error(
+        LMInvalidRequestError("permission denied", status=403)
+    )
+
+    class ProviderDenied(Exception):
+        status = 402
+
+    class ProviderWrapper(Exception):
+        status_code = 403
+
+    assert is_fatal_provider_error(ProviderDenied("credits"))
+    assert is_fatal_provider_error(ProviderWrapper("forbidden"))

@@ -18,9 +18,10 @@ from typing import Any, get_args, get_origin
 
 import dspy
 from dspy.utils.exceptions import AdapterParseError
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
-from .config import PROJECT_ROOT
+from . import schemas as _schemas
+from .config import ConfigurationError, PROJECT_ROOT
 from .data import canonical_document
 from .schemas import (
     RULES_VERSION,
@@ -34,15 +35,27 @@ from .schemas import (
 BASELINE_PROMPT_PATH = PROJECT_ROOT / "prompts" / "baseline.txt"
 EDITORIAL_RULES_PATH = PROJECT_ROOT / "data" / "editorial_rules_v1.md"
 PROGRAM_SOURCE_PATH = Path(__file__).resolve()
+SCHEMAS_SOURCE_PATH = Path(_schemas.__file__).resolve()
+SOURCE_PATHS = {
+    "program.py": PROGRAM_SOURCE_PATH,
+    "schemas.py": SCHEMAS_SOURCE_PATH,
+}
 BASELINE_PROMPT_VERSION = "baseline_v1"
 STRICT_ADAPTER_VERSION = 1
 
 
 def load_baseline_instructions() -> str:
     """Load the frozen manual baseline instructions."""
-    text = BASELINE_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    try:
+        text = BASELINE_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ConfigurationError(
+            f"baseline prompt cannot be read: {BASELINE_PROMPT_PATH}"
+        ) from exc
     if not text:
-        raise ValueError("baseline prompt must contain non-whitespace text")
+        raise ConfigurationError(
+            "baseline prompt must contain non-whitespace text"
+        )
     return text
 
 
@@ -266,18 +279,54 @@ def _annotation_name(annotation: object) -> str:
     return repr(annotation)
 
 
+def _annotation_schema(annotation: object) -> dict[str, object]:
+    """Return the complete nested JSON schema for one annotation."""
+    try:
+        schema = TypeAdapter(annotation).json_schema()
+    except Exception as exc:  # noqa: BLE001 - fail closed on unknown types
+        raise AssertionError(
+            f"cannot derive a schema for annotation {annotation!r}: {exc}"
+        ) from exc
+    if not isinstance(schema, dict):
+        raise AssertionError("annotation schema must be a JSON object")
+    return schema
+
+
 def baseline_schema() -> dict[str, object]:
-    """Return the frozen input/output field schema identity."""
+    """Return the complete frozen input/output schema identity.
+
+    Field names and annotation names alone do not capture nested enums,
+    length limits, required properties, or nested model definitions. The
+    complete JSON schema is persisted and hashed so incompatible artifacts
+    cannot pass compatibility checks.
+    """
     return {
         "inputs": [
-            {"name": name, "annotation": _annotation_name(field.annotation)}
+            {
+                "name": name,
+                "annotation": _annotation_name(field.annotation),
+                "json_schema": _annotation_schema(field.annotation),
+            }
             for name, field in EditorialQASignature.input_fields.items()
         ],
         "outputs": [
-            {"name": name, "annotation": _annotation_name(field.annotation)}
+            {
+                "name": name,
+                "annotation": _annotation_name(field.annotation),
+                "json_schema": _annotation_schema(field.annotation),
+            }
             for name, field in EditorialQASignature.output_fields.items()
         ],
     }
+
+
+def program_source_sha256() -> str:
+    """Hash every source file that defines the program/type contract."""
+    payload = {
+        name: _sha256_file(path)
+        for name, path in sorted(SOURCE_PATHS.items())
+    }
+    return _sha256_text(_canonical_json(payload))
 
 
 def _sha256_text(text: str) -> str:
@@ -343,7 +392,11 @@ def baseline_manifest() -> dict[str, object]:
         "schema": schema,
         "schema_sha256": _sha256_text(_canonical_json(schema)),
         "prompt_sha256": _sha256_file(BASELINE_PROMPT_PATH),
-        "source_sha256": _sha256_file(PROGRAM_SOURCE_PATH),
+        "source_sha256": program_source_sha256(),
+        "source_files": {
+            name: _sha256_file(path)
+            for name, path in sorted(SOURCE_PATHS.items())
+        },
     }
     return {
         **payload,
@@ -360,6 +413,8 @@ __all__ = [
     "BASELINE_PROMPT_PATH",
     "BASELINE_PROMPT_VERSION",
     "EDITORIAL_RULES_PATH",
+    "PROGRAM_SOURCE_PATH",
+    "SCHEMAS_SOURCE_PATH",
     "EditorialQA",
     "EditorialQASignature",
     "StrictJSONAdapter",
@@ -372,4 +427,5 @@ __all__ = [
     "load_baseline_instructions",
     "load_editorial_rules",
     "parse_strict_output",
+    "program_source_sha256",
 ]

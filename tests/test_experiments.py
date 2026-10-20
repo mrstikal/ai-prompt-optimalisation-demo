@@ -875,7 +875,8 @@ def test_optimization_compile_exception_is_a_failed_record(
     )
 
     assert result.manifest.status == "failed"
-    assert "simulated compile failure" in result.manifest.stop_reason
+    assert result.manifest.stop_reason == "compile_error"
+    assert "simulated compile failure" in (result.manifest.error_message or "")
     assert result.stats["detailed_results"] is None
     assert result.selected_program.program_id == (
         result.baseline_program.program_id
@@ -940,3 +941,81 @@ def test_feedback_metric_matches_scalar_metric_and_gepa_contract() -> None:
     assert isinstance(feedback.feedback, str)
     assert feedback.feedback
     assert len(feedback.feedback) <= 400
+
+
+def test_live_phase_rejects_price_increase_before_creating_run(
+    monkeypatch, tmp_path
+) -> None:
+    original = experiments.fetch_endpoint_catalog
+
+    def inflated_fetch(model: str):
+        payload = original(model)
+        payload["data"]["endpoints"][0]["pricing"]["prompt"] = "1"
+        return payload
+
+    monkeypatch.setattr(
+        experiments, "fetch_endpoint_catalog", inflated_fetch
+    )
+    runs_root = tmp_path / "runs"
+    with pytest.raises(
+        ExperimentConfigurationError, match="catalog validation failed"
+    ):
+        run_baseline_development(
+            make_settings(),
+            load_validation_cases(),
+            confirm_budget=True,
+            origin="live",
+            run_id="dev-price",
+            runs_root=runs_root,
+            programs_root=tmp_path / "programs",
+        )
+    assert not runs_root.exists()
+
+
+def test_live_optimization_rejects_held_out_records(tmp_path) -> None:
+    held_out = load_cases(DATA_DIR / "test.jsonl")
+    with pytest.raises(
+        ExperimentConfigurationError, match="frozen train split"
+    ):
+        run_optimization(
+            make_settings(),
+            held_out,
+            load_validation_cases(),
+            baseline_development_run_id="dev-missing",
+            confirm_budget=True,
+            origin="live",
+            runs_root=tmp_path / "runs",
+            programs_root=tmp_path / "programs",
+        )
+
+
+def test_live_phases_fetch_current_route_catalog_snapshots(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[str] = []
+    original = experiments.fetch_endpoint_catalog
+
+    def recording_fetch(model: str):
+        calls.append(model)
+        return original(model)
+
+    monkeypatch.setattr(
+        experiments, "fetch_endpoint_catalog", recording_fetch
+    )
+    result = run_baseline_development(
+        make_settings(),
+        load_validation_cases(),
+        confirm_budget=True,
+        origin="live",
+        run_id="dev-catalog",
+        runs_root=tmp_path / "runs",
+        programs_root=tmp_path / "programs",
+    )
+    settings = make_settings()
+    assert calls == [settings.task_model, settings.reflection_model]
+    config = json.loads(
+        (result.run_dir / "config.json").read_text(encoding="utf-8")
+    )
+    snapshots = config["route_catalog_snapshots"]
+    assert snapshots["task"]["model"] == settings.task_model
+    assert snapshots["reflection"]["model"] == settings.reflection_model

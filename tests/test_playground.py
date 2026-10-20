@@ -7,7 +7,12 @@ from pathlib import Path
 import dspy.clients.lm as dspy_lm
 import pytest
 
-from dspy_lab.artifacts import RUN_REQUESTS_FILENAME
+from dspy_lab.artifacts import (
+    RUN_REQUESTS_FILENAME,
+    list_run_directories,
+    open_playground_run,
+    read_run_manifest,
+)
 from dspy_lab.config import Settings
 from dspy_lab.experiments import (
     ExperimentConfigurationError,
@@ -228,6 +233,28 @@ def test_playground_rejects_mismatched_ledger(tmp_path, monkeypatch) -> None:
         )
 
 
+def test_playground_writes_discoverable_manifest_without_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    root, _calls, result = run_fixture_playground(tmp_path, monkeypatch)
+    manifest = read_run_manifest(result.run_dir)
+    assert manifest.kind == "playground"
+    assert manifest.snapshot is None
+    assert manifest.status == "completed"
+    assert RUN_REQUESTS_FILENAME not in manifest.files
+    entries = list_run_directories(root / "runs", kind="playground")
+    assert [entry.run_id for entry in entries] == [result.run_id]
+    recorded = open_playground_run(
+        result.run_dir,
+        runs_root=root / "runs",
+        programs_root=root / "programs",
+    )
+    assert recorded.manifest.run_id == result.run_id
+    assert recorded.summary["status"] == "completed"
+    assert recorded.summary["retain_content"] is False
+    assert recorded.requests == {}
+
+
 def test_playground_retains_content_only_when_explicitly_enabled(
     tmp_path, monkeypatch
 ) -> None:
@@ -260,6 +287,23 @@ def test_playground_retains_content_only_when_explicitly_enabled(
     )
     assert summary["retain_content"] is True
     assert summary["arms"]["baseline"]["findings"][0]["evidence"] == "výnos jistý"
+    manifest = read_run_manifest(result.run_dir)
+    assert RUN_REQUESTS_FILENAME in manifest.files
+    recorded = open_playground_run(
+        result.run_dir,
+        runs_root=root / "runs",
+        programs_root=root / "programs",
+    )
+    assert recorded.requests
+    request_text = json.dumps(
+        [
+            dict(message)
+            for request in recorded.requests.values()
+            for message in request.messages
+        ],
+        ensure_ascii=False,
+    )
+    assert TITLE in request_text
 
 
 def test_playground_parse_failure_is_preserved_and_not_retried(
@@ -297,3 +341,19 @@ def test_playground_cancelled_ledger_dispatches_nothing(
     assert result.baseline.status == "error"
     assert result.optimized.status == "error"
     assert result.baseline.request_ids == ()
+
+
+def test_playground_rejects_changed_inference_protocol(tmp_path) -> None:
+    root = fixture_root(tmp_path)
+    with pytest.raises(
+        ExperimentConfigurationError, match="archived inference"
+    ):
+        run_playground(
+            make_settings(temperature=0.5),
+            optimization_run_id="opt-ui",
+            title=TITLE,
+            article_text=ARTICLE,
+            confirm_budget=True,
+            runs_root=root / "runs",
+            programs_root=root / "programs",
+        )

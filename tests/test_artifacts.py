@@ -1296,3 +1296,64 @@ def test_run_manifest_schema_version_and_run_id_are_enforced(
     atomic_write_json(path, payload)
     with pytest.raises(ArtifactCorruptError, match="does not match"):
         artifacts.read_run_manifest(archive.benchmark_dir)
+
+
+def test_request_reader_compacts_lifecycle_snapshots(tmp_path) -> None:
+    path = tmp_path / "requests.jsonl"
+    base = _request("call-1", 1)
+    admitted = RecordedRequest.model_validate(
+        {**base, "status": "admitted", "cost_status": "none"}
+    )
+    in_flight = admitted.model_copy(update={"status": "in_flight"})
+    succeeded = admitted.model_copy(
+        update={
+            "status": "succeeded",
+            "cost_status": "estimated",
+            "estimated_cost_usd": Decimal("0.00001"),
+            "reported_cost_usd": Decimal("0.00001"),
+        }
+    )
+    atomic_write_jsonl(
+        path,
+        [
+            admitted.model_dump(mode="json"),
+            in_flight.model_dump(mode="json"),
+            succeeded.model_dump(mode="json"),
+        ],
+    )
+    loaded = artifacts.read_recorded_requests(path)
+    assert loaded["call-1"].status == "succeeded"
+
+    atomic_write_jsonl(
+        path,
+        [
+            succeeded.model_dump(mode="json"),
+            admitted.model_copy(update={"status": "released"}).model_dump(
+                mode="json"
+            ),
+        ],
+    )
+    with pytest.raises(ReplayError, match="contradictory terminal"):
+        artifacts.read_recorded_requests(path)
+
+    pending = admitted.model_copy(
+        update={"status": "pending", "cost_status": "pending"}
+    )
+    reconciled = admitted.model_copy(
+        update={
+            "status": "reconciled",
+            "cost_status": "actual",
+            "reported_cost_usd": Decimal("0.00001"),
+        }
+    )
+    atomic_write_jsonl(
+        path,
+        [
+            pending.model_dump(mode="json"),
+            reconciled.model_dump(mode="json"),
+        ],
+    )
+    assert (
+        artifacts.read_recorded_requests(path)["call-1"].status
+        == "reconciled"
+    )

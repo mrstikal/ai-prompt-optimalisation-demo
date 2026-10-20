@@ -10,10 +10,12 @@ positives.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import dspy
 from pydantic import ValidationError
 
 from .data import (
@@ -338,7 +340,13 @@ def _coerce_scoring_case(gold: object) -> ScoringCase:
     if separator_end is _MISSING:
         separator_end = None
     if title is not None:
-        title_length = len(canonicalize_text(title))
+        canonical_title = canonicalize_text(title)
+        if not document_text.startswith(canonical_title):
+            raise ScoringConfigurationError(
+                "gold document_text must start with the canonical title when "
+                "title is supplied"
+            )
+        title_length = len(canonical_title)
         separator_start = title_length
         separator_end = title_length + len(TITLE_BODY_SEPARATOR)
     elif separator_start is None and separator_end is None:
@@ -375,11 +383,6 @@ def validate_scoring_case(case: ScoringCase) -> None:
             f"{case.case_id}: separator offsets must be provided together"
         )
     if case.separator_start is not None and case.separator_end is not None:
-        if case.document_text.count(TITLE_BODY_SEPARATOR) != 1:
-            raise ScoringConfigurationError(
-                f"{case.case_id}: scoring text must contain exactly one "
-                "title/body separator"
-            )
         if not (
             0 <= case.separator_start < case.separator_end
             <= len(case.document_text)
@@ -466,7 +469,6 @@ def _validate_gold_finding(case: ScoringCase, issue: GoldFinding) -> None:
         ):
             continue
         matched = True
-        break
     if not matched:
         raise ScoringConfigurationError(
             f"{case.case_id}/{issue.issue_id}: no match option contains the "
@@ -544,7 +546,7 @@ def _all_gold_edges(
 def _maximum_matching(
     adjacency: Sequence[Sequence[int]],
     gold_count: int,
-) -> tuple[dict[int, int], dict[int, int]]:
+) -> tuple[list[int], list[int]]:
     """Deterministic maximum-cardinality one-to-one matching.
 
     The caller supplies adjacency in prediction order and sorts each
@@ -687,10 +689,48 @@ def _false_positive_reason(
     )
 
 
+_SCORING_CASE_CACHE_LIMIT = 256
+_SCORING_CASE_CACHE: dict[int, tuple[object, ScoringCase]] = {}
+_SCORING_CASE_CACHE_LOCK = threading.Lock()
+
+
+def _validated_scoring_case(gold: object) -> ScoringCase:
+    """Validate a reused gold object once and cache its scoring case.
+
+    GEPA and benchmark evaluation reuse the same immutable ``CaseRecord`` or
+    ``dspy.Example`` objects for many predictions. Caching by object identity
+    avoids repeating every gold evidence location scan while keeping arbitrary
+    mappings on the strict validate-every-call path.
+    """
+    if not isinstance(gold, (CaseRecord, ScoringCase, dspy.Example)):
+        scoring_case = _coerce_scoring_case(gold)
+        validate_scoring_case(scoring_case)
+        return scoring_case
+    key = id(gold)
+    with _SCORING_CASE_CACHE_LOCK:
+        cached = _SCORING_CASE_CACHE.get(key)
+        if cached is not None and cached[0] is gold:
+            return cached[1]
+    scoring_case = (
+        gold
+        if isinstance(gold, ScoringCase)
+        else (
+            scoring_case_from_case(gold)
+            if isinstance(gold, CaseRecord)
+            else _coerce_scoring_case(gold)
+        )
+    )
+    validate_scoring_case(scoring_case)
+    with _SCORING_CASE_CACHE_LOCK:
+        if len(_SCORING_CASE_CACHE) >= _SCORING_CASE_CACHE_LIMIT:
+            _SCORING_CASE_CACHE.clear()
+        _SCORING_CASE_CACHE[key] = (gold, scoring_case)
+    return scoring_case
+
+
 def score_case(case: object, prediction: object) -> CaseScore:
     """Score one article against its reviewed gold issues."""
-    scoring_case = _coerce_scoring_case(case)
-    validate_scoring_case(scoring_case)
+    scoring_case = _validated_scoring_case(case)
     parsed = parse_prediction(prediction)
     gold_findings = scoring_case.gold_findings
     clean_case = not gold_findings
@@ -1110,8 +1150,6 @@ def feedback_metric(
     """GEPA-compatible metric returning score and deterministic feedback."""
     del trace, pred_name, pred_trace
     score = score_case(gold, pred)
-    import dspy
-
     return dspy.Prediction(
         score=score.reward, feedback=build_feedback(score)
     )
