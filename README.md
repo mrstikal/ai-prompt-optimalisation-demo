@@ -1,599 +1,660 @@
 # DSPy Prompt Optimization Lab
 
-Standalone lab for reviewing Czech precious-metals articles with one DSPy
-predictor and comparing a frozen zero-shot baseline with a genuine GEPA
-instruction-optimized program.
+Explore whether an automatically optimized prompt can review Czech articles
+more accurately than a manually written prompt, without changing the language
+model. This interactive demo checks precious-metals articles for editorial
+problems, explains its findings, and compares the original and optimized
+instructions on the same articles.
 
-**Status: S1-S15 tooling implemented; the paid first held-out run is pending
-operator approval and an API key.** S1 establishes the isolated Python
-environment, dependency lock, package skeleton, and configuration contract. S2
-adds the frozen six-code editorial rules, strict typed schemas,
-canonicalization/offset validation, and the first five training specimens. S3
-completes the 30-case training set with review audit, family descriptions, and a
-coverage report. S4 adds 10 validation and 10 held-out test cases, a frozen split
-manifest, family/near-duplicate checks, and a 50-entry review audit. S5 adds the
-deterministic evidence matcher, corpus and per-category metrics, clean-case
-reward, and the scalar/GEPA feedback interfaces, backed by hand-computed unit
-fixtures and dataset-level self-match checks. S6 adds the frozen one-predictor
-DSPy baseline, the strict JSON adapter, the canonical four-input whitelist, the
-baseline fingerprint/manifest, and offline scripted-transport tests. S7 adds the
-strict-budget guarded LM, one shared atomic request ledger, conservative Decimal
-reservations, reconciliation for unknown costs, cancellation/budget-stop
-semantics, request telemetry, and secret redaction, all tested against a mocked
-LiteLLM transport. S8 adds frozen OpenRouter route profiles, strict
-single-provider routing, public endpoint-catalog snapshots, an explicitly
-confirmed three-call compatibility preflight, and local JSON preflight records.
-S9 adds atomic state-only program artifacts, linked development/optimization/
-benchmark run manifests with exact case/rule snapshots, a strictly offline
-Replay reader, and shared sent-versus-preview trace formatting. S10 adds the
-separately confirmed baseline validation evaluation and genuine GEPA compile
-paths, complete native candidate statistics, request/response/event
-persistence, linked development/optimization run records, and selected-program
-serialization. S11 adds the separately confirmed paired benchmark engine,
-sealed test snapshots, deterministic per-case A/B and B/A ordering, exact
-per-arm predictions/errors/metrics, micro-versus-mean metrics, cost and
-latency summaries, cost-only break-even economics, validity/completeness
-gates, and test-reuse exposure history. S12 adds the global Live/Replay
-selector and the read-only Overview, Baseline, and Prompt Inspector screens.
-S13 adds one confirmation-gated Live optimization job backed by a single local
-worker thread, durable progress events, cooperative cancellation, a server-side
-single-job lock, and restart-interruption records. S14 adds stored
-baseline/optimized Comparison with deterministic raw-finding/gold re-scoring, per-case
-corrected/newly missed issue views, candidate navigation, and a read-only
-Replay Playground. Live adds a separately confirmed paired benchmark action
-and an unscored Playground that runs both frozen artifacts on supplied text
-with its own two-call budget; article text is not persisted unless explicitly
-opted in. Replay remains the default and exposes no paid execution path. S15 adds the
-offline release validator, the acceptance-report format, the baseline
-development CLI, and the "prepare once with Live, present repeatedly with
-Replay" workflow. The real released archive and its acceptance record cannot be
-produced without an API key and explicit human approval of the separate spend
-caps; no paid API call has been made.
+Use it to:
 
-## Requirements
+- Find unsupported numbers, misleading investment claims, unfinished text,
+  incorrect citations, and contradictions with supplied product facts.
+- Optimize review instructions with DSPy and GEPA instead of editing prompts
+  through trial and error.
+- Compare detection quality, missed issues, false alarms, response times, token
+  usage, and costs for both prompts.
+- Inspect the instructions, optimization candidates, and actual messages sent
+  to the models.
+- Try both prompts on your own article in the Live Playground.
+- Present a recorded experiment repeatedly in Replay without an API key,
+  internet access, or additional model charges.
 
-- Linux or WSL2
-- uv 0.13.1
-- Project Python 3.14.8, pinned by `.python-version`
+**Results are not bundled with the source code.** A fresh checkout opens the
+interface but has no recorded experiment to display. Prepare a real experiment
+with the Live runbook below, or obtain a complete trusted archive from its
+operator. Optimization can improve, preserve, or reduce quality; the demo does
+not promise an improvement or substitute sample results for measurements.
 
-The host may have CPython 3.15.0 installed. DSPy 3.4.1 declares
-`requires-python >=3.10,<3.16`, but its `litellm` and `gepa[dspy]==0.1.4`
-dependencies are marked `python_version < "3.15"`. On Python 3.15 `dspy.GEPA`
-is an ImportError stand-in, so this project deliberately rejects 3.15 instead
-of silently substituting the host interpreter.
+## Contents
 
-## Setup
+- [How the demo works](#how-the-demo-works)
+- [Using the interface](#using-the-interface)
+- [Understanding the results](#understanding-the-results)
+- [Technologies and their benefits](#technologies-and-their-benefits)
+- [Runbook: first installation](#runbook-first-installation)
+- [Configuration and budgets](#configuration-and-budgets)
+- [Runbook: prepare a Live experiment](#runbook-prepare-a-live-experiment)
+- [Runbook: daily operation](#runbook-daily-operation)
+- [Troubleshooting](#troubleshooting)
+- [Scope and limitations](#scope-and-limitations)
+
+## How the demo works
+
+### Article review
+
+The reviewer receives an article title and body, editorial rules, and optional
+product facts and source excerpts. It checks only this supplied information:
+it does not search the web or independently verify cited URLs.
+
+Each finding contains a category code, an exact quote from the article, and a
+short explanation in Czech. A valid review may contain no findings. The demo
+reviews text; it does not rewrite the article or provide investment advice.
+
+| Category | What the reviewer looks for |
+|---|---|
+| `UNSUPPORTED_NUMERIC_CLAIM` | A numerical product, market, historical-price, supply, or performance claim unsupported by the supplied references. |
+| `INVESTMENT_ADVICE_AS_FACT` | An unqualified investment recommendation presented as an objective fact. |
+| `UNWARRANTED_CERTAINTY` | An unconditional promise of future returns, price growth, or absence of investment risk. |
+| `UNRESOLVED_PLACEHOLDER` | Unfinished content such as `TODO`, `{{...}}`, or an editorial marker. |
+| `INVALID_CITATION` | A citation to a missing local source, or to an excerpt that does not support the attributed claim. |
+| `PRODUCT_FACT_MISMATCH` | A product attribute that contradicts the supplied reference data. |
+
+The full definitions, exceptions, and examples are in the
+[editorial rules](data/editorial_rules_v1.md).
+
+### From baseline to comparison
+
+1. **Evaluate the baseline.** Run the original, manually written instructions
+   against the validation articles to establish a starting point.
+2. **Optimize the instructions.** GEPA examines training results and feedback,
+   asks a reflection model to propose better instructions, and evaluates
+   candidates using training and validation data.
+3. **Select and freeze a prompt.** Keep the selected instructions for the final
+   comparison. The original prompt may remain the best candidate.
+4. **Run a paired benchmark.** Review each held-out article, kept out of prompt
+   tuning, with both frozen prompts. The task model, rules, reference
+   information, and inference settings stay the same; only the instructions
+   differ.
+5. **Inspect or replay the experiment.** Browse the recorded findings,
+   prompts, metrics, costs, and timing without rerunning inference.
+
+The included dataset has **50 Czech articles**: 30 for training, 10 for
+validation, and 10 for the held-out benchmark. It includes clean articles and
+articles with one or more annotated issues. These reference annotations, also
+called *gold labels*, provide the expected findings for scoring. Test articles
+are excluded from optimization and candidate selection.
+
+### Live and Replay
+
+| | Live Experiment | Replay Experiment |
+|---|---|---|
+| Purpose | Prepare experiments and review new articles. | Inspect an existing recorded experiment. |
+| API key and connectivity | Required for model calls. | Not required after local setup and archive transfer. |
+| Model calls | Only after a separate budget confirmation for each action. | None. |
+| Additional API cost | Paid usage, subject to the confirmed limits. | Zero; original experiment costs remain visible. |
+| New optimization or benchmark | Available with the required prior runs. | Unavailable. |
+| New Playground review | Available after optimization. | Disabled. |
+
+The application always starts in **Replay Experiment**. Starting the server,
+changing screens, or inspecting records does not authorize a paid operation.
+
+## Using the interface
+
+Choose **Experiment mode**, then a page under **Screen**. In Replay, select a
+**Recorded benchmark archive**; in Live, select a **Recorded baseline
+development run** to work with its linked experiments.
+
+| Screen | What you can do |
+|---|---|
+| **Overview** | Check experiment identity, models, data versions, warnings, and whether the archive is a measured Live experiment. |
+| **Baseline** | Review the original instructions and validation outcomes, including errors and the starting quality metrics. |
+| **Optimization** | Browse candidates and optimization history. In Live, confirm and start a new optimization using a completed baseline evaluation. |
+| **Comparison** | Inspect paired benchmark results, category-level metrics, corrected issues, newly missed issues, costs, and timing. In Live, explicitly start a new benchmark. |
+| **Prompt Inspector** | Compare instructions and inspect recorded task/reflection messages. Unsent previews are labeled separately from actual requests. |
+| **Playground** | In Live, review your own article with both frozen prompts without a gold-based score, and inspect prior Playground records. New inference is disabled in Replay. |
+
+An empty or damaged archive produces a visible message. The application never
+generates replacement results automatically. Only a completed, released Live
+benchmark is labeled as a **measured** Replay experiment; mock or unreleased
+records are not evidence of measured performance.
+
+## Understanding the results
+
+The comparison checks findings against reference annotations, including whether
+the quoted passage actually identifies the issue. Repeated or unsupported
+findings are not silently removed, and malformed responses remain errors.
+
+| Measure | How to interpret it |
+|---|---|
+| Precision | Of the reported issues, how many were correct? Higher means fewer false alarms. |
+| Recall | Of the expected issues, how many were found? Higher means fewer missed issues. |
+| Micro-F1 | Combines precision and recall across all findings in the benchmark. This is the main overall quality measure. |
+| Macro-F1 | Gives each of the six categories equal weight. Useful for spotting uneven performance. |
+| Exact match | The share of articles with exactly the expected findings and no extras. |
+| Mean article reward | The average per-article scoring reward used during optimization. It is not micro-F1. The displayed DSPy Evaluate percentage is also a mean reward. |
+| Parsing success | Whether the model returned a valid structured response, not whether the findings were correct. |
+| Cost and latency | Historical request costs and response times for the recorded experiment. Labels distinguish actual, estimated, reserved (`committed`), pending, unavailable, or zero known cost (`none`). |
+
+An official quality-improvement verdict requires a complete, comparable, valid
+benchmark with higher micro-F1 and no reduction in exact match. Incomplete or
+invalid runs cannot establish an improvement. Cost-only break-even is shown
+only when quality does not regress, cost amounts are known (actual, estimated,
+or zero), and per-article savings are positive; otherwise there is no finite
+supported break-even point. A result based on estimated costs is labeled
+conditional, not a final billing calculation.
+
+Validation scores guide optimization, so they are not independent proof of
+improvement. The test set is small, and repeated benchmarks on the same test
+data carry an exploratory-reuse warning. Reopening Replay is not a new test.
+
+## Technologies and their benefits
+
+### DSPy: measurable prompt optimization
+
+[DSPy](https://dspy.ai/) describes a language-model task through named inputs,
+typed outputs, and an evaluation metric. In this demo, that task is editorial
+review. Instead of judging a prompt only by a few convincing examples, you
+can measure how well it detects known issues across a dataset.
+
+DSPy connects the reviewer, evaluation, and optimization workflow. Its benefit
+here is a repeatable comparison: the original and optimized instructions solve
+the same task and return the same kind of result.
+
+### GEPA: learning from explanations of mistakes
+
+[GEPA](https://github.com/gepa-ai/gepa) is the optimizer used through DSPy. It
+uses results and textual feedback about failures to propose new instructions,
+then evaluates candidates and keeps promising alternatives.
+
+This is **prompt optimization, not model fine-tuning**: model weights do not
+change. The result is an inspectable instruction text. Candidate history and
+instruction differences help explain what changed, while the held-out
+benchmark checks whether those changes generalize beyond the search data.
+
+### Task and reflection models: separate roles
+
+The **task model** reviews articles. The **reflection model** proposes prompt
+changes during optimization; it is not a second reviewer in the final
+benchmark. Separating these roles allows a smaller task model to serve the
+repeatable review workload while a stronger model helps improve instructions.
+
+A *route* fixes both the model and the provider serving its requests. The
+default task route is DeepSeek V4.1 Flash
+(`deepseek/deepseek-v4.1-flash-1017`, provider `deepinfra/fp8`). The default
+reflection route is GPT-6 Sol (`openai/gpt-6-sol`, provider `openai`). A
+supported lower-cost alternative uses the same DeepSeek route for reflection.
+Neither choice guarantees better results; quality and economics must be read
+from the experiment.
+
+### OpenRouter and LiteLLM: access and visibility
+
+[OpenRouter](https://openrouter.ai/) provides API access to the configured
+models. One server-side API key supplies both model roles. Fixed provider
+routes avoid silently switching providers during an experiment, and a
+compatibility preflight checks the advertised capabilities and price limits.
+
+[LiteLLM](https://docs.litellm.ai/) connects DSPy to those APIs and exposes
+response metadata such as token usage and request identifiers. Together with
+the demo's budget controls, this makes model usage visible and attributable to
+each phase. Live inference still sends article content to external services;
+running the browser locally does not make inference local.
+
+### Streamlit: interactive inspection
+
+[Streamlit](https://streamlit.io/) provides the browser interface for browsing
+experiments, inspecting prompts, and starting confirmed Live jobs. The same
+interface can present an archived experiment without repeating paid work.
+No separate database service or frontend installation is required, and
+Streamlit usage telemetry is disabled for this project.
+
+### Pydantic, JSON, and local archives: trustworthy records
+
+[Pydantic](https://docs.pydantic.dev/) validates structured inputs and outputs.
+It helps distinguish a valid review from a malformed model response instead
+of treating every returned string as a successful answer.
+
+Experiments are stored locally as JSON (structured text), JSONL (one JSON
+record per line), and plain text, including prompts, reference snapshots,
+outcomes, request metadata, and checksums. This supports offline Replay,
+integrity checks, and backups without a database. It also means the archive
+directories must be preserved together, not just a screenshot or one summary
+file.
+
+### Python, uv, and pytest: reproducible operation
+
+Python runs the application and its AI tooling. [uv](https://docs.astral.sh/uv/)
+installs the project's Python interpreter and locked dependencies into an
+isolated environment, leaving the system interpreter untouched.
+[pytest](https://docs.pytest.org/) provides the offline verification command
+used before operation and after environment changes.
+
+The validated environment is Python **3.14.8**, uv **0.13.1**, DSPy **3.4.1**,
+GEPA **0.1.4**, LiteLLM **1.106.0**, Pydantic **2.14.1**, and Streamlit
+**1.66.0**. Use the supplied lockfile rather than installing current package
+versions individually. Python 3.15 is not supported by this project's
+DSPy/GEPA dependency combination.
+
+## Runbook: first installation
+
+### 1. Prepare the machine
+
+Use Linux or a Linux distribution inside WSL2 (Windows Subsystem for Linux 2),
+a Bash shell, Git, curl, and a modern browser. Installation needs internet
+access; Live work also needs an OpenRouter account, API key, and sufficient
+credit. Replay needs neither an account nor a key.
+
+On Ubuntu or Ubuntu under WSL2, install the basic tools if missing:
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y git curl ca-certificates
+```
+
+Install the validated uv version using its official installer, if needed:
+
+```bash
+curl -LsSf https://astral.sh/uv/0.13.1/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+Expect `uv 0.13.1`. The installer executes a downloaded script; review the
+[official installation instructions](https://docs.astral.sh/uv/getting-started/installation/)
+if your environment requires another installation method.
+
+### 2. Obtain and install the project
+
+Skip cloning if you already have the repository. Run all subsequent commands
+from the repository root, the directory containing `app.py` and `uv.lock`.
+
+```bash
+git clone https://github.com/mrstikal/ai-prompt-optimalisation-demo.git
+cd ai-prompt-optimalisation-demo
 uv python install 3.14.8
 uv sync --frozen
-uv run python --version
-uv run pytest
+uv run --frozen --offline python --version
+uv run --frozen --offline pytest -q
 ```
 
-`uv run python --version` must report `Python 3.14.8`. `uv.lock` is part of
-the deliverable and must be committed; `uv sync --frozen` must not re-resolve
-dependencies. Dependency changes require a deliberate `uv lock` and review.
+Python must report `Python 3.14.8`, and the tests must pass. The default test
+suite is offline: it does not need a key or make paid calls. `uv sync --frozen`
+creates the local `.venv` from `uv.lock`; no manual activation is needed.
 
-## UI
+### 3. Start the interface safely
 
 ```bash
-uv run streamlit run app.py --server.address 127.0.0.1
+uv run --frozen --offline streamlit run app.py \
+  --server.address 127.0.0.1 --server.port 8501 --server.headless true
 ```
 
-The app opens in Replay Experiment mode without an API key. For Live
-Experiment, launch it with `uv run --env-file .env streamlit run app.py
---server.address 127.0.0.1` so the configured key and budgets reach the
-process (see the Live runbook below). Replay reads only recorded local
-artifacts, makes no provider/catalog/billing request, and shows zero
-additional API calls or cost. Replay exposes all six screens: Comparison
-shows stored paired metrics and per-case changes, and Playground is explicitly
-disabled for new inference. Live Experiment adds checkbox-confirmed
-optimization, paired benchmark, and unscored Playground actions, each with its
-own budget; no work starts until the relevant confirmation form is submitted.
-The Live Playground sends supplied article text to the provider, keeps output
-in the current app session, and writes article/request text only when the
-operator opts in.
+Open **http://127.0.0.1:8501**. Expect **Replay Experiment** and the six-screen
+navigation. With no archive installed, expect **No recorded experiment
+available**, not example measurements. Stop the server with `Ctrl+C` before
+continuing with Live setup.
 
-## Configuration
+`--server.headless true` skips Streamlit's interactive first-run email prompt
+and automatic browser opening. Open the URL yourself after the server starts.
 
-Live work reads server-side environment variables. Replay and offline
-inspection need no key and make no provider, catalog, or billing request.
+To use an existing archive instead, restore the complete `runs/` and
+`artifacts/` directories from a trusted experiment prepared with a compatible
+project version using [Preserve and restore experiments](#preserve-and-restore-experiments).
+Start the same command and select **Recorded benchmark archive**. For a new
+experiment, continue below.
+
+## Configuration and budgets
+
+Create `.env` once, without overwriting an existing configuration:
 
 ```bash
-cp .env.example .env
+cp -n .env.example .env
+chmod 600 .env
 ```
 
-Set `OPENROUTER_API_KEY` in `.env` before running a Live command. An empty
-value is rejected with `MissingConfigurationError`. Then verify the loaded
-configuration without making a request:
+`chmod 600` allows only your user account to read or write `.env`. Edit the
+file locally and set `OPENROUTER_API_KEY` to your own key. Keep the remaining
+defaults for the first run. The file is ignored by Git. Do not put the key in
+source code, a URL, a screenshot, or a shared archive.
+
+Commands load `.env` only when it is explicitly passed with `--env-file .env`.
+Validate the configuration without contacting a provider:
 
 ```bash
-uv run --env-file .env python -c \
+uv run --frozen --offline --env-file .env python -c \
   "from dspy_lab.config import load_settings; print(load_settings('live').redacted())"
 ```
 
-`load_settings("replay")` is the safe default. It never requires
-`OPENROUTER_API_KEY`. `load_settings("live")` validates the key, bare
-OpenRouter model IDs, provider pins, numeric limits, and the relationship
-between the GEPA metric-call target and the total optimization call cap. It
-performs no network request. Provider capability, strict-schema, and pricing
-checks happen only in the separately authorized S8 preflight.
+Expect a redacted settings summary, not the secret itself. This validates
+local configuration, not key validity, available credit, or model availability.
 
-Frozen initial defaults are defined in `src/dspy_lab/config.py`:
+### Spending limits
 
-| Setting | Default |
+Every paid phase needs its own approval. These are maximum budgets, not price
+quotes or promised costs:
+
+| Phase | Maximum request attempts | Maximum USD | Environment settings |
+|---|---:|---:|---|
+| Compatibility preflight | 3 | 4.50 | `MAX_PREFLIGHT_COST_USD` (call count is fixed) |
+| Baseline validation | 10 | 0.50 | `MAX_BASELINE_DEV_CALLS`, `MAX_BASELINE_DEV_COST_USD` |
+| Optimization, including task and reflection calls | 160 | 5.00 | `MAX_OPTIMIZATION_CALLS`, `MAX_OPTIMIZATION_COST_USD` |
+| Paired held-out benchmark | 20 | 0.50 | `MAX_BENCHMARK_CALLS`, `MAX_BENCHMARK_COST_USD` |
+| One Playground comparison | 2 | 0.15 | `MAX_PLAYGROUND_CALLS`, `MAX_PLAYGROUND_COST_USD` |
+
+The four preparation phases have combined default caps of **10.50 USD**;
+one optional Playground review adds **0.15 USD**. These are not a shared
+lifetime allowance: each new run authorizes a new phase budget.
+Call limits count admitted request attempts, not only successful answers.
+
+Before sending a request, the application reserves a conservative cost based
+on the allowed context and output size. A run can therefore stop even when
+the displayed spend is below its cap. The default preflight cap accounts for
+this reservation, not just the short sample responses. Pending or unknown
+costs are not treated as free, and cancellation cannot refund sent requests.
+
+### Other settings
+
+| Setting | Default and purpose |
 |---|---|
-| Task model | `deepseek/deepseek-v4.1-flash-1017` |
-| Task provider pin | `deepinfra/fp8` |
-| Reflection model | `openai/gpt-6-sol` |
-| Reflection provider pin | `openai` |
-| Cheaper reflection alternative | `deepseek/deepseek-v4.1-flash-1017` on `deepinfra/fp8` |
-| Task temperature / output cap | 0.0 / 2048 tokens |
-| Reflection temperature / output cap | 1.0 / 4096 tokens |
-| GEPA metric-call target | 120 |
-| Optimization call / USD cap | 160 / 5.00 USD |
-| Baseline development call / USD cap | 10 / 0.50 USD |
-| Benchmark call / USD cap | 20 / 0.50 USD |
-| Playground call / USD cap | 2 / 0.15 USD |
-| Preflight calls / USD cap | 3 / 4.50 USD |
-| Cache / threads / automatic retries | off / 1 / 0 |
-| GEPA seed / reflection minibatch | 42 / 3 |
+| `TASK_MODEL`, `TASK_PROVIDER` | DeepSeek route listed above; used for both comparison arms. |
+| `REFLECTION_MODEL`, `REFLECTION_PROVIDER` | GPT-6 Sol route listed above; used during optimization. |
+| `TEMPERATURE`, `MAX_OUTPUT_TOKENS` | `0.0`, `2048` for article review. |
+| `REFLECTION_TEMPERATURE`, `REFLECTION_MAX_OUTPUT_TOKENS` | `1.0`, `4096` for prompt proposals. |
+| `MAX_OPTIMIZATION_METRIC_CALLS` | `120`; GEPA's evaluation target, distinct from the total 160-call budget. Keep the default 40-call headroom for the first run. |
+| `REQUEST_TIMEOUT_SECONDS` | `120` per request. |
 
-`MAX_OPTIMIZATION_CALLS` counts every admitted optimization model-dispatch
-attempt, not only reflection proposals. GEPA's `max_metric_calls` is a separate
-limit. Budget enforcement itself is implemented in S7.
+Automatic retries and inference caching are disabled. Only the supported
+model/provider combinations are accepted; model names are bare OpenRouter
+IDs, without an extra `openrouter/` prefix. Do not change task settings halfway
+through a linked experiment.
 
-## Dataset contract (S2-S4)
+For the supported cheaper reflection alternative, set both
+`REFLECTION_MODEL=deepseek/deepseek-v4.1-flash-1017` and
+`REFLECTION_PROVIDER=deepinfra/fp8` before preparation. A preflight cap of
+`MAX_PREFLIGHT_COST_USD=0.35` covers its current conservative reservation;
+rerun preflight to check compatibility. Do not assume arbitrary models or
+providers can be substituted.
 
-- `data/editorial_rules_v1.md` is the frozen six-code policy: definitions,
-  exclusions, precedence, positive/negative examples, numerical/hypothetical
-  boundaries, negation, quotations, citation rules, and evidence limits.
-- `src/dspy_lab/schemas.py` defines strict Pydantic models for model findings,
-  cases, product facts, sources, gold annotations, match options, review
-  records, and review-audit entries. Unknown codes, extra fields, wrong types,
-  whitespace-only text, and overlong evidence/explanation values are rejected
-  without coercion.
-- `src/dspy_lab/data.py` applies NFC, LF, and NBSP/NNBSP normalization, builds
-  the canonical title + blank line + body text, validates unique literal
-  evidence, half-open code-point anchors/context windows, the title/body
-  separator, split composition, code coverage, hard negatives, same-code
-  multi-issue cases, reference consistency, family disjointness, near-duplicate
-  flags, review audit, and dataset hashes.
-- `data/v1/train.jsonl` contains 30 training cases: 6 clean, 12 one-issue, and
-  12 two-issue articles with 36 gold findings, exactly six occurrences of each
-  code, four hard negatives, and one same-code multi-issue case.
-- `data/v1/validation.jsonl` and `data/v1/test.jsonl` contain 10 cases each:
-  2 clean, 4 one-issue, and 4 two-issue articles with 12 gold findings and
-  exactly two occurrences of each code per split. The test split is sealed for
-  optimization.
-- `data/v1/split_manifest.json` freezes the 30/10/10 counts, family
-  assignments, per-file and combined hashes, and the near-duplicate report.
-  `data/v1/coverage_report.json` records the training-only coverage report.
-  `data/v1/reviews.jsonl` contains one approved review-audit entry per case.
-- The labels have an independent automated review by `decision-reviewer`.
-  Training was reviewed in three batches; two unannotated title guarantees were
-  removed and verified, and two related descriptive titles were neutralized.
-  The validation/test split review is recorded in the review audit, and the
-  final manifest audit was completed before freezing. Human sign-off is still
-  required before final gold and before the held-out run.
+## Runbook: prepare a Live experiment
+
+Complete installation and configuration first. Review each budget separately
+before executing the corresponding command or submitting a confirmation form.
+These steps make real, paid API calls; they are not setup checks.
+
+Before the first held-out benchmark, arrange independent human approval of the
+reference annotations. Automated dataset checks are not human sign-off. Keep
+test articles and labels out of prompt tuning, including manual tuning.
+
+The bundled review audit in `data/v1/reviews.jsonl` contains automated reviews,
+not human approvals. Human sign-off is a separate dataset-review process;
+the demo provides no CLI command to record it. Until human approvals are
+recorded in that audit, expect a `gold_approval` warning and partial dataset
+acceptance even when archive validation passes. Do not edit frozen dataset
+or audit files merely to silence the warning.
+
+### 1. Check provider compatibility
 
 ```bash
-uv run python -c \
-  "from pathlib import Path; from dspy_lab.data import load_all_splits; print({k: len(v) for k, v in load_all_splits(Path('data/v1')).items()})"
-```
-
-## Baseline program and scoring (S5-S6)
-
-- `src/dspy_lab/metrics.py` implements deterministic literal evidence matching,
-  anchor/context containment, maximum-cardinality one-to-one assignment,
-  TP/FP/FN accounting, per-category/micro/macro F1, clean-case reward,
-  invalid-output accounting, and deterministic GEPA feedback. `scalar_metric`
-  and `feedback_metric` share the same `score_case` core.
-- `src/dspy_lab/program.py` defines exactly one `EditorialQASignature`, one
-  `dspy.Predict` inside `EditorialQA`, and the `StrictJSONAdapter` subclass. The
-  adapter reuses DSPy formatting/native-schema generation but rejects repairs,
-  duplicate keys, nonfinite values, unknown fields, defaults, and coercion. The
-  module has no demonstrations and persists no LM.
-- `prompts/baseline.txt` is the frozen manual baseline instruction text.
-  `baseline_manifest()` records the instructions, schema, prompt/rules/source
-  hashes, zero demos, one predictor, no LM, and a stable fingerprint.
-- `tests/test_program.py` drives the real DSPy predictor through a scripted
-  offline transport, checks native-schema and JSON-mode requests, proves parse
-  failures make exactly one request, verifies the four-input whitelist and no
-  gold leakage, and integrates the resulting `dspy.Prediction` with the S5
-  metric.
-
-## Budget guard and request ledger (S7)
-
-- `src/dspy_lab/llm.py` defines `GuardedLM`, a genuine `dspy.LM` with
-  `engine="litellm"` that reserves one attempt and a conservative Decimal USD
-  amount before delegating. It enforces `num_retries=0`, `cache=False`, `n=1`,
-  the configured output cap, and the expected schema mode.
-- One `BudgetLedger` is shared by task and reflection LMs and by
-  `.copy()`/`copy.copy`/`copy.deepcopy`, so a copy cannot reset a budget. Its
-  lock makes concurrent admission atomic. The call cap and USD cap are
-  inclusive at the boundary.
-- By default the input reservation uses the full admissible context bound; an
-  optional verified token counter plus formatting overhead can reduce it.
-  `ModelPricing` keeps Decimal USD-per-million rates, converts from catalog
-  USD-per-token rates, and includes request/cache-write charges.
-- `BudgetExceeded`/`BudgetCancelled` are execution-control `BudgetStop`
-  exceptions, not quality failures. A stop persists: later calls are rejected
-  without dispatch even if a library catches the exception.
-- Every request record preserves phase/model/provider, messages, sanitized
-  request parameters, reservation, generation ID, token usage, finish reason,
-  estimated/actual cost status, and errors with secrets redacted. Unknown-cost
-  and timeout reservations remain unresolved until `reconcile()`.
-- `Settings.optimization_budget()`, `baseline_dev_budget()`,
-  `benchmark_budget()`, and `playground_budget()` expose the named
-  `BudgetLimits` phases.
-
-## Provider preflight (S8)
-
-- `src/dspy_lab/config.py` freezes three known OpenRouter routes: the task
-  route `deepseek/deepseek-v4.1-flash-1017` on `deepinfra/fp8` (native strict
-  schema, 0.098/0.294 USD per million), the strong default reflection route
-  `openai/gpt-6-sol` on `openai` (native schema, 4.00/15.00 USD per million
-  long-context ceiling), and the cheaper alternative reflection route
-  `deepseek/deepseek-v4.1-flash-1017` on `deepinfra/fp8` (explicit JSON-object
-  mode). It also freezes context/output bounds, cache-write ceilings, and a
-  3-call/4.50 USD preflight budget. The cheaper reflection route can be
-  selected with `REFLECTION_MODEL`/`REFLECTION_PROVIDER` and needs about
-  0.35 USD for the same three-call preflight.
-- `src/dspy_lab/llm.py` pins every real LM to one provider with
-  `only`/`order`, `allow_fallbacks=false`, `require_parameters=true`,
-  `data_collection=deny`, and reasoning disabled. Provider routing, schema
-  mode, `drop_params`, streaming, cache controls, and retries are rejected
-  before dispatch if they deviate from the contract.
-- `src/dspy_lab/preflight.py` is the only S8 network entry point. It fetches
-  the public endpoint catalog for both routes, rejects missing tags, prices
-  above the frozen ceilings, service tiers, and schema drift, then makes
-  exactly two task calls (one clean and one multi-issue training case) and one
-  256-token reflection call. There are no retries or model swaps.
-- Each attempt writes `runs/preflight/<run_id>.json` atomically with mode 0600.
-  The record captures the public endpoint snapshot, request messages, routing,
-  request parameters (including the strict wire `response_format`), generation
-  IDs, usage, estimated cost, finish reasons, schema modes, checks, warnings,
-  and the shared ledger. The API key is
-  redacted and never written.
-- The default 4.50 USD cap covers the conservative full-context reservation
-  of two DeepSeek task calls plus one GPT-6 Sol reflection call (about 4.47
-  USD). The cheaper DeepSeek reflection alternative reserves about 0.31 USD;
-  lower `MAX_PREFLIGHT_COST_USD` deliberately when selecting it. The raised
-  optimization cap (5.00 USD) is required because one full-context GPT-6 Sol
-  reflection reservation is about 4.26 USD; actual token spend is normally
-  much lower.
-
-```bash
-# Explicit authorization; this spends real money (up to the confirmed cap).
-uv run --env-file .env python -m dspy_lab.preflight \
+uv run --frozen --env-file .env python -m dspy_lab.preflight \
   --confirm-preflight-budget
 ```
 
-The preflight fails before any model dispatch when the conservative
-reservation does not fit the cap. Catalog metadata requests are public and
-cost no tokens, but they do require network access. Do not run the command
-until the separate preflight budget has been approved.
+This checks the public provider catalog and makes two task-model calls plus
+one reflection-model call. Expect a JSON summary with `status: "passed"`,
+`admitted_calls: 3`, and a `record_path` under `runs/preflight/`. If it fails,
+resolve the cause before continuing. There is no automatic model fallback.
 
-## Baseline Development and GEPA (S10)
-
-- `run_baseline_development()` evaluates the frozen zero-demo baseline once on
-  the supplied validation cases under a separate explicit confirmation. The
-  default budget is 10 admitted calls and 0.50 USD. Every case receives a
-  recorded outcome, including parse/request errors and cases not reached after a
-  budget stop; per-case cost and request IDs stay visible. The summary also
-  labels the always-empty reward as a calculated reference, not a model run.
-- `run_optimization()` requires a separate confirmation and a completed linked
-  baseline development run with the same frozen baseline program, rules,
-  validation snapshot, metric version, and task model/request protocol. It
-  reserves one-third of the metric target as admitted-call headroom, capped at
-  40 slots (the default 120/160 configuration gives exactly 40), while the
-  ledger cap remains authoritative for any final-batch overhang.
-- The compile uses the real `dspy.GEPA` with the shared feedback metric, seed
-  42, one thread, zero demos, no merges, and a unique native log directory. The
-  baseline object and artifact are checked for immutability. A fresh copy is
-  optimized; task and reflection calls share one ledger.
-- Requests and raw responses are persisted as they complete. `gepa_stats.json`
-  keeps the complete native `DspyGEPAResult.to_dict()` payload, candidate
-  instructions, lineage, validation scores, discovery counts, and the observed
-  metric/task/reflection counts. Successful runs save the selected state-only
-  program with baseline lineage and round-trip it before the manifest is
-  written. An unchanged baseline may win; it is linked without a duplicate
-  artifact. Perfect-baseline skips and all-proposal failures are labeled
-  explicitly, and budget-stopped or failed compiles are never marked completed.
-
-## Paired Benchmark (S11)
-
-- `load_sealed_benchmark_cases()` is the only test-split loader; optimization
-  never calls it. The production split manifest hash, case IDs, and families are
-  checked before the ten test cases are returned.
-- `run_benchmark()` requires its own explicit confirmation and phase budget. It
-  loads the baseline program linked by the completed development run and the
-  exact selected program linked by the completed optimization run. It never
-  invokes GEPA or saves a program; tests patch both paths to fail and still
-  exercise the real saved-program inference path.
-- Each test case is evaluated through `dspy.Evaluate` on a one-case devset with
-  `scalar_metric`, one thread, no retries, no cache, and the frozen task
-  protocol. Arm order is randomized per case from the stored seed; both orders,
-  byte-identical inputs, and equal task-config fingerprints are archived.
-  Every attempted arm produces an outcome, including parse/request errors and
-  raw responses. A stop before all planned arms is `stopped` and incomplete;
-  all attempts with one or more errors is `completed` but fails the validity
-  gate.
-- The summary reports raw TP/FP/FN, Precision, Recall, corpus micro-F1,
-  macro-F1, exact-match count/rate, parsing success, corrected/regressed cases,
-  per-category support and regressions, both `dspy.Evaluate` rounded
-  percentages and unrounded mean-case reward, token totals, cost per attempted
-  article with actual/estimated status, separate task-train, task-validation,
-  reflection, and inference costs, and latency in milliseconds with raw,
-  median, and exploratory p95 values.
-- Official improvement verdicts require a complete, comparable, fully valid
-  run with strictly higher micro-F1 and non-lower exact match. The cost-only
-  gate uses the same non-regression condition. Break-even uses
-  `ceil(C_opt / (c_A - c_B))` and is reported as no finite break-even for zero
-  or negative savings, unknown/pending costs, or a failed quality gate.
-  Optimization and baseline-development costs are reported separately; the
-  cost-only calculation uses the optimization run cost.
-- Each benchmark records its sealed-test snapshot hash, exposure index,
-  prior-run reuse history, and an explicit first-blind or exploratory
-  reevaluation label. Repeated runs preserve prior IDs and cannot become fresh
-  confirmatory evidence retroactively.
-
-## Release Validation and First Held-Out Run (S15)
-
-S15 is an operator stage, not a source of fabricated evidence. The committed
-code can prepare the baseline, run the confirmed Live workflow, and validate a
-genuine released archive offline. This workspace currently has no
-`OPENROUTER_API_KEY`, no `runs/`, and no `artifacts/`, so **no released Live
-archive or first held-out result exists yet**. Mock/test archives must never be
-presented as measured results.
-
-### Prepare once with Live
-
-Do not run these commands until the preflight, baseline development,
-optimization, benchmark, and optional playground budgets have been separately
-approved. The caps are listed in the configuration table above; starting the
-application or running the default test suite never starts a paid job.
+### 2. Evaluate the original prompt
 
 ```bash
-uv python install 3.14.8
+uv run --frozen --env-file .env python -m dspy_lab.release \
+  baseline-development --confirm-budget
+```
+
+This evaluates the baseline on the 10 validation articles. Expect a JSON
+summary with `status: "completed"`, `origin: "live"`, a `run_id`, and a
+`run_dir` under `runs/development/`. Note the run ID. Baseline preparation is
+a CLI operation; the UI does not create this prerequisite for you.
+
+Do not proceed with a failed or stopped run. Do not repeat a successful
+baseline evaluation for every presentation; the recorded run can be reused.
+
+### 3. Optimize the instructions
+
+Start the server with the Live configuration:
+
+```bash
+uv run --frozen --env-file .env streamlit run app.py \
+  --server.address 127.0.0.1 --server.port 8501 --server.headless true
+```
+
+1. Open **http://127.0.0.1:8501** and choose **Live Experiment**.
+2. In **Recorded baseline development run**, select the completed run from
+   the previous step. Open **Baseline** to inspect its validation results.
+3. Open **Optimization**. Review the selected run, task/reflection routes,
+   training and validation counts, and the optimization budget. The earlier
+   baseline evaluation has its own budget; it is not rerun by this action.
+4. Check the optimization-budget authorization box and click **Start confirmed
+   optimization**.
+5. Keep the server running. Review progress, candidate history, and costs.
+   Wait for `completed`, then note the optimization run ID and selected prompt.
+
+`stopped`, `failed`, and `interrupted` are not successful optimizations. An
+unchanged baseline can legitimately be selected; inspect the warnings and
+candidate history rather than assuming optimization must improve the prompt.
+
+### 4. Run and release the paired benchmark
+
+1. Open **Comparison** in Live mode.
+2. In **Completed optimization run for the paired benchmark**, select the
+   completed optimization linked to your baseline run.
+3. Review the held-out-test warning and the separate benchmark budget.
+4. Check **Release the completed benchmark as a measured Replay archive**.
+5. Check the benchmark-budget and sealed-split confirmation: permission to
+   open the test articles excluded from optimization. Click **Start confirmed
+   benchmark**.
+6. Wait for `completed`. Note **Recorded benchmark run**, check **Released as
+   measured: yes**, and review the verdict, validity, and warnings about prior
+   uses of the test data.
+
+This reviews all 10 test articles with both prompts, for 20 planned calls. It
+does not optimize again. Repeating it exposes the same test set again and is
+recorded as exploratory reevaluation, not a fresh blind result. A stopped or
+failed benchmark cannot be released as a measured archive; a completed run
+with invalid responses still cannot support an official improvement verdict.
+
+### 5. Validate the archive offline
+
+Replace the value below with the recorded benchmark run ID. No key or network
+access is required for this validation:
+
+```bash
+BENCHMARK_RUN_ID='replace-with-recorded-benchmark-run-id'
+uv run --frozen --offline python -m dspy_lab.release validate \
+  --benchmark-run-id "$BENCHMARK_RUN_ID" \
+  --json "runs/release_validation/$BENCHMARK_RUN_ID-acceptance.json"
+```
+
+Expect `Release validation: PASS` and exit code 0. Validation checks archive
+integrity, linked records, paired inputs, metrics, costs, timing, and repeated
+read-only access. It rejects mock, unreleased, incomplete, or corrupt archives.
+Read warnings and acceptance items too: a pass does not replace human sign-off
+or certify unperformed operator checks. Playground behavior and the offline
+test suite are not proven by a benchmark archive alone.
+
+Keep the resulting acceptance report with the experiment. Do not write reports
+inside an individual run archive or `artifacts/programs/`.
+
+### 6. Optionally review your own article
+
+1. Open **Playground** in Live mode and select the completed run under
+   **Optimization run supplying both artifacts**.
+2. Fill in **Article title** and **Article body** with a Czech article. Both
+   are required; limits are 300 and 20,000 characters respectively.
+3. Leave **Optional product facts (JSON object)** as `{}` and **Optional
+   sources (JSON array)** as `[]`, or supply references in the formats below.
+4. Leave **Store this article and request text locally for audit** unchecked
+   unless local content retention is intended.
+5. Confirm the separate Playground budget and external transmission of the
+   article, then click **Run unscored playground**.
+6. Compare both sets of findings, errors, messages, usage, costs, and timing.
+
+Example product facts, not a required template:
+
+```json
+{"metal": "silver", "mass_g": 100, "purity": "999/1000"}
+```
+
+Example local source excerpt:
+
+```json
+[
+  {
+    "source_id": "S1",
+    "title": "Product specification",
+    "excerpt": "The silver bar has a mass of 100 g and a purity of 999/1000.",
+    "provenance": "Operator-supplied product sheet"
+  }
+]
+```
+
+`mass_g` must be a JSON number, not a quoted string. Each source requires
+`source_id`, `excerpt`, and `provenance`; source IDs must be unique. Citations
+such as `[S1]` refer to these supplied IDs. Excerpts are supplied as text, not
+downloaded from `provenance`. Unknown fields are rejected.
+
+Playground is **unscored**: there are no gold labels, it does not affect
+candidate selection, and its results are not benchmark evidence. With content
+retention off, only hashes, status, cost, and timing are saved; findings and
+messages remain in the current app session. Opting in also saves content for
+later inspection under **Recorded playground runs** in Live Playground.
+
+## Runbook: daily operation
+
+### Present a recorded experiment
+
+After installation and archive preparation, use:
+
+```bash
+uv run --frozen --offline streamlit run app.py \
+  --server.address 127.0.0.1 --server.port 8501 --server.headless true
+```
+
+Select **Replay Experiment**, choose **Recorded benchmark archive**, and check
+its measured status and warnings in **Overview**. A useful presentation order
+is **Baseline**, **Optimization**, **Prompt Inspector**, then **Comparison**.
+The original costs remain visible; additional API calls and API cost are zero.
+No new Playground review or experiment can run in this mode.
+
+For Live operation, use the same startup command with `--env-file .env` and
+without `--offline`, as shown in the preparation runbook. Selecting Live alone
+does not start a job. Review the selected run and budget before every action.
+
+### Stop, cancel, and restart
+
+- Let active work finish, or use **Cancel optimization**, **Cancel benchmark**,
+  or **Cancel playground** on its job panel. Cancellation prevents subsequent
+  dispatches, but an already-sent request may finish and incur a charge.
+- Wait for a terminal status before pressing `Ctrl+C` in the server terminal.
+  Closing the browser tab is not cancellation of server-side work.
+- Restart with the appropriate startup command above. Completed records remain
+  available. A job interrupted by a server restart is recorded explicitly and
+  is never automatically resumed; any new attempt needs a fresh confirmation
+  and budget review.
+- Run only one application instance per working directory. The UI permits one
+  paid job at a time, and mode switching is blocked while it is active. Do not
+  run the paid CLI preparation commands concurrently with UI jobs.
+
+If port 8501 is occupied, use `--server.port 8502` and open
+**http://127.0.0.1:8502**. Keep `--server.address 127.0.0.1`: the demo is intended
+for local operation, not an unauthenticated public service with spending
+controls exposed to other users.
+
+### Preserve and restore experiments
+
+| Path | What to preserve |
+|---|---|
+| `runs/` | Preflight records, baseline evaluations, optimizations, benchmarks, Playground records, job history, and acceptance reports. |
+| `artifacts/` | Saved original/selected prompts and their compatibility and integrity metadata. |
+| `.env` | Local credentials and settings; keep separately in protected storage, never in a shared demo archive. |
+| `uv.lock`, `.python-version`, project revision | The environment and application version needed to operate the saved experiment reliably. |
+
+`runs/` and `artifacts/` are ignored by Git. Cloning or pulling the repository
+does not transfer experiment results. Preserve both directories together;
+copying only a benchmark directory omits its linked baseline, optimization,
+and prompt records.
+
+For example, after a completed experiment, stop the server and create a local
+backup from the repository root:
+
+```bash
+umask 077
+tar -czf "../dspy-lab-state-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" \
+  runs artifacts uv.lock .python-version
+git rev-parse HEAD
+```
+
+`umask 077` restricts newly created files in this shell to your user account,
+including the backup. Record the printed project revision with the backup and
+preserve any local source changes separately. The archive excludes `.env`,
+but may still contain article text, model messages, reference annotations,
+and outputs. Treat it as sensitive, check retained content before sharing,
+and restrict backup access.
+
+To restore, install the matching project revision in a separate clean
+directory, extract the trusted backup there with `tar -xzf /path/to/backup.tar.gz`,
+run `uv python install 3.14.8` and `uv sync --frozen`, then rerun offline tests
+and release validation with the original benchmark ID. Start Replay and verify
+the same IDs, warnings, and results. Configure a new local `.env` only if Live
+operation is needed. Do not overlay a backup onto active or different runs.
+
+### Configuration changes and maintenance
+
+Stop the server before changing `.env`, then restart it with `--env-file .env`.
+Keep the task model, provider, rules, and inference settings consistent across
+linked phases; incompatible changes are rejected rather than silently mixed.
+Review a new configuration and preflight before preparing a new experiment.
+
+After restoring or changing the environment, rerun:
+
+```bash
 uv sync --frozen
-uv run python --version          # must report 3.14.8
-uv run pytest                    # offline; no key, no paid call
-cp .env.example .env             # set OPENROUTER_API_KEY locally
-
-# 1. Explicitly confirmed compatibility preflight.
-uv run --env-file .env python -m dspy_lab.preflight \
-  --confirm-preflight-budget
-
-# 2. Explicitly confirmed baseline development evaluation on validation only.
-uv run --env-file .env python -m dspy_lab.release baseline-development \
-  --confirm-budget
+uv run --frozen --offline python --version
+uv run --frozen --offline pytest -q
 ```
 
-The baseline command prints the development run ID. Start the UI and use Live
-Experiment for the remaining phases:
+Do not use `uv lock`, unpinned package upgrades, or manual archive edits as
+routine fixes. Dependency changes need a deliberate compatibility check, and
+editing archived files invalidates their integrity checks. Historical Replay
+results should remain unchanged.
 
-```bash
-uv run --env-file .env streamlit run app.py --server.address 127.0.0.1
-```
+## Troubleshooting
 
-1. Open **Optimization**, select the completed development run, review the
-   10-call/0.50 USD baseline and 160-call/5.00 USD optimization caps, check the
-   confirmation box, and start the run. Wait for a completed `optimization` run;
-   a stopped or failed compile remains an honest failed record.
-2. Open **Comparison**, select that optimization run, review the sealed-test
-   warning, the 20-call/0.50 USD benchmark cap, and check **Release the
-   completed benchmark as a measured Replay archive**. Confirm and wait for the
-   completed `benchmark` run.
-3. Optionally open **Playground**, supply a new Czech article and optional
-   references, confirm its separate 2-call/0.15 USD budget, and review the
-   unscored findings/messages/usage/cost/latency.
-
-Validate the released archive offline (no key, no network):
-
-```bash
-uv run python -m dspy_lab.release validate \
-  --benchmark-run-id <benchmark-run-id> \
-  --json runs/release_validation/<benchmark-run-id>-acceptance.json
-```
-
-The validator refuses mock, unreleased, incomplete, corrupt, or hash-mismatched
-archives; recomputes stored metrics/deltas from archived raw findings and gold;
-checks paired inputs, request references, latency structure, cost status,
-exposure/test index, task configs, program snapshots, secret patterns, and
-repeated-read immutability; and exits nonzero if any archive check fails. `A9` and `A10` are
-reported as `not_covered` because they are exercised by the separately
-confirmed Playground and the default test suite, not by a benchmark archive.
-`verified` in the acceptance record means the archive-checkable evidence
-passed; `partial` means the recorded evidence is present but fresh-checkout or
-restart behavior still needs operator/reviewer sign-off.
-
-### Present repeatedly with Replay
-
-Once a genuine released archive exists locally:
-
-```bash
-uv run --offline streamlit run app.py --server.address 127.0.0.1
-```
-
-The app opens in Replay with no API key and no outbound dependency resolution.
-Select the archived experiment and use Overview, Baseline, Optimization,
-Comparison, and Prompt Inspector repeatedly. All prompts, candidates, diffs,
-outputs, metrics, costs, latencies, IDs, hashes, and exposure warnings are read
-from the archive. New inference, GEPA, benchmark creation, and Playground
-inference are unavailable in Replay. Missing archives fail explicitly; they are
-never regenerated or replaced by a fixture.
-
-### Acceptance checklist
-
-| ID | Evidence |
+| Symptom | Action |
 |---|---|
-| A1 | README setup commands, frozen 3.14.8 environment, offline default tests. |
-| A2 | 50 cases, 30/10/10 splits, sealed test, six-category coverage, frozen hashes. |
-| A3 | Completed linked Live baseline development run with all ten outcomes. |
-| A4 | Completed linked Live GEPA run with native candidate/reflection evidence; unchanged baseline is valid. |
-| A5 | State-only program snapshots with identical instructions/schema, zero demos, one predictor. |
-| A6 | Ten paired test inputs, both arms, identical input hashes, invalid outputs retained. |
-| A7 | Prompt Inspector and release validator read recorded client messages; previews are not marked sent. |
-| A8 | Comparison and validator show metrics, parsing/evidence failures, costs, status, latency, and break-even. |
-| A9 | Separate Live Playground with its own budget and no gold score; Replay cannot run it. |
-| A10 | Default tests cover budget caps, cancellation, secret safety, reproducibility, and rerun protection. |
-| A11 | Linked manifests/configs/outcomes preserve IDs, timestamps, versions, hashes, seed, counts, usage, costs, timing. |
-| A12 | Honest verdict (improved/unchanged/regressed/inconclusive) and original warnings remain visible. |
-| A13 | Released archive reproduced offline after restart with identical IDs/hashes and zero new calls. |
-
-The acceptance record links these IDs to concrete run IDs, artifacts, tests,
-and reviewer sign-off. A bug found after test exposure must be fixed
-transparently; a revised benchmark retains its reuse warning and cannot
-retroactively become the first blind experiment. Until a genuine released
-archive exists, A3/A4/A6/A13 remain pending and must not be claimed as
-accomplished.
-
-## Artifacts and Replay (S9)
-
-- Programs are saved under `artifacts/programs/<program_id>/` as
-  `program.json` (trusted DSPy state only), `manifest.json`, and
-  `instructions.txt`. The manifest records the content-derived program ID,
-  parent/creation IDs, origin (`live` or `mock_test`), zero demos, `lm: null`,
-  full signature schema, rules/prompt/source hashes, dependency versions,
-  state hash/size, and checksums. No benchmark score or credential is stored.
-- Saving creates the artifact in a temporary sibling directory, scans for
-  configured secret values (including `OPENROUTER_API_KEY` by default) and
-  credential-bearing keys, then atomically renames the directory. File writes
-  use a temporary file, `fsync`, mode 0600, and `os.replace`; an interrupted
-  write cannot appear complete. Run files are scanned for the same configured
-  secrets without a size-based skip.
-- Live loading requires `origin=live` unless `allow_mock=True` is explicit, and
-  checks the manifest/schema/state hashes, rules/prompt/source identity,
-  adapter version, and exact Python/application/DSPy/GEPA/LiteLLM/Pydantic
-  versions before calling the trusted DSPy `.load()`. A mismatch is a clear
-  compatibility error, not a warning or best-effort import. The predictor keeps
-  `lm=None`; Live inference attaches the guarded LM through runtime context.
-- Run records live under
-  `runs/development|optimization|benchmarks|playground/<run_id>/`. A manifest
-  links program IDs and hashes, exact `inputs_snapshot.jsonl` cases, the rules
-  snapshot, outcomes, requests, and optional native GEPA statistics. Development snapshots are validation-only, optimization
-  snapshots are train+validation, and benchmarks are test-only; linked runs
-  must share rules and dataset versions.
-- `open_replay_archive()` validates the benchmark's file hashes, linked
-  development/optimization run IDs, program hashes, exact rule snapshots, and
-  every outcome's case, candidate, arm/phase, program, split, and canonical
-  input hash. It reads only recorded JSON/JSONL/text data: no current-dataset
-  lookup, LM construction, provider/catalog request, GEPA compile, `Predict`,
-  `Evaluate`, or native program `.load()`.
-- Replay exposes `additional_api_calls=0` and `additional_api_cost_usd=0.00`.
-  A completed, released `origin=live` benchmark is the only archive reported as
-  measured. Mock/test archives remain visibly labeled and untrusted for
-  results; missing, incomplete, corrupt, or mismatched records fail explicitly.
-- `format_sent_trace()` preserves the exact recorded messages and provider
-  metadata, including generation ID, usage, and estimated cost.
-  `format_preview_trace()` is a separate type with `sent=false`, no generation
-  ID/usage/cost, and an explicit notice. S8 preflight call records use the same
-  trace shape.
-- No released live archive exists yet. S9 tests build temporary mock archives
-  and never present them as measured results.
-
-## Frozen API contracts
-
-These are the version-specific contracts S1 is pinned against. Later stages
-must test them against the installed packages rather than assuming they hold.
-
-- `dspy==3.4.1`, `gepa[dspy]==0.1.4`, `litellm==1.106.0`,
-  `pydantic==2.14.1`, and `streamlit==1.66.0` are the frozen contract versions.
-  `verify_runtime_contract()` rejects a missing or stubbed `dspy.GEPA`, an
-  unexpected module, a missing `gepa.optimize`, or a missing LiteLLM
-  completion backend.
-- `dspy.GEPA` accepts exactly one of `auto`, `max_full_evals`, or
-  `max_metric_calls` and compiles with explicit training and validation sets.
-  The GEPA metric signature is
-  `metric(gold, pred, trace=None, pred_name=None, pred_trace=None)` and returns
-  `dspy.Prediction(score=..., feedback=...)`.
-- `dspy.Evaluate` is keyword-only. Its `.score` is a rounded 0-100 percentage
-  mean of per-case scores, and `.results` contains per-case triples. Neither is
-  corpus micro-F1.
-- Stock `JSONAdapter` repairs JSON, extracts objects with a regex, and filters
-  unknown root fields. The planned task parser is a small strict subclass that
-  rejects those behaviors; it is implemented in S6.
-- Task and reflection LMs use `engine="litellm"`, `num_retries=0`,
-  `cache=False`, `n=1`, and one thread. Callbacks are observational because
-  their exceptions are swallowed; budget enforcement happens before dispatch
-  in S7.
-- LiteLLM 1.106.0 tries to refresh its remote model-cost map during import.
-  `dspy_lab/__init__.py` sets `LITELLM_LOCAL_MODEL_COST_MAP=True` before any
-  DSPy/LiteLLM import, so package import, Replay, and offline tests never fetch
-  it. LiteLLM's local map is not the authoritative experiment price; Live
-  provider prices are snapshotted from OpenRouter in S8.
-- Program persistence uses `.save(path, save_program=False)` plus a fresh
-  instance and `.load(path)`. State is not a self-contained safe class
-  implementation, and no untrusted pickle artifact is loaded.
-
-## Testing
-
-```bash
-uv run pytest
-```
-
-The default suite is offline: it requires no API key, makes no paid call, and
-excludes tests marked `live`. The S8 live test is selected explicitly only
-after a separate budget confirmation:
-
-```bash
-RUN_LIVE_PREFLIGHT=1 uv run --env-file .env pytest -m live \
-  tests/test_preflight.py
-```
-
-Tests
-verify the actual Python version, the committed lockfile, genuine GEPA/LiteLLM
-availability, Python 3.15 rejection, configuration validation, secret
-redaction, no network access during package import, strict schema behavior,
-canonicalization, exact evidence offsets, all six codes, precedence and
-non-violations, 30/10/10 split composition and code coverage, hard negatives,
-the same-code multi-issue case, reference consistency, family and hash
-disjointness, near-duplicate checks, the 50-entry review audit, the frozen split
-manifest, deterministic scoring and maximum-cardinality matching, duplicate and
-evidence-failure accounting, undefined-ratio behavior, scalar/GEPA wrapper
-agreement, one-predictor DSPy baseline behavior, strict JSON/native-schema
-requests, zero-demo fingerprint stability, no gold leakage, exact budget
-reservation/call caps, shared-ledger copies, concurrent admission, unknown-cost
-retention, cancellation, real adapter fallback accounting, price-unit
-conversion, secret redaction, rejection of the sealed test path by the
-optimization loader, frozen route profiles, single-provider routing, schema
-mode determinism, catalog drift rejection, the exact two-task/one-reflection
-preflight plan, failure records without retries, preflight budget enforcement,
-state-only program identity/load compatibility, runtime LM reattachment,
-atomic/secret-safe artifacts, linked run and snapshot consistency, offline
-Replay without LM/native loading or current-dataset substitution, mock archive
-labeling, sent-versus-preview trace separation, ten-case baseline outcome and
-budget retention, separate phase confirmations, fixed task-protocol linkage,
-baseline immutability, zero demos, genuine offline GEPA candidate discovery,
-native statistics and proposal/call capture, selected-program round-trip,
-unchanged-baseline and perfect-skip labeling, stopped/failed compile records,
-synthetic sealed fixtures, deterministic A/B and B/A ordering, equal input and
-task-config fingerprints, all-error retention, invalid/incomplete gates,
-micro-versus-mean metrics, millisecond latency summaries, actual/estimated
-costs, positive/zero/negative cost savings, no-compile saved-program
-reevaluation, Replay compatibility, test-reuse exposure history, released
-archive acceptance, tampered/unreleased-archive rejection, artifact-hash
-immutability during repeated validation, and zero-dispatch offline validation.
+| `uv: command not found` | Open a new shell after installation, or add the installer directory to `PATH`; for the default install, use `export PATH="$HOME/.local/bin:$PATH"`. |
+| Wrong Python version, or Python 3.15 rejected | Run `uv python install 3.14.8`, `uv sync --frozen`, and use `uv run` from the project root instead of the system `python`. |
+| Offline startup cannot find a package or interpreter | Complete the online installation first. `--offline` does not download a missing environment. |
+| No recorded experiment available | Install a complete trusted archive, or finish the Live workflow through benchmark release. Installation alone creates no measurements. |
+| Live configuration is incomplete or the key is missing | Set `OPENROUTER_API_KEY` in `.env` and restart using `uv run --frozen --env-file .env streamlit run ...`. A plain startup does not load the file. |
+| Preflight fails on model, provider, schema, or price checks | Read its error/record, verify supported route IDs and connectivity, and check provider availability. Do not bypass it by silently switching routes. |
+| Budget stop despite low displayed spend | Review unresolved reservations and both call/USD caps. Conservative reservations may exceed the remaining budget. Do not repeatedly restart or raise caps without reviewing new spending. |
+| Optimization has no usable baseline run | Complete the CLI baseline-development step and select its `completed`, `live` record. Stopped, failed, and mock runs are not usable prerequisites. |
+| Linked settings or artifact versions differ | Restore the matching settings and project environment, or prepare a new consistently configured experiment. Do not edit manifests to bypass checks. |
+| Another job or active-job lock blocks a start | Check all server processes and **Recent Live job records**. Let the real job finish or cancel it. After a crash, restart once for recovery; inspect an unreadable lock rather than deleting it while work may be active. |
+| Multiple released archives make validation ambiguous | Pass the intended `--benchmark-run-id` explicitly, as in the runbook. |
+| Archive integrity or release validation fails | Preserve the error and original records, verify all linked directories are present, and restore a known-good backup if needed. Do not regenerate or relabel data as a fix. |
+| Playground rejects references | Use one JSON object for facts and an array for sources; use numeric `mass_g`, unique source IDs, and all required source fields. Unknown fields are not accepted. |
+| Playground findings disappear after a session ends | This is expected with content retention off. Only explicitly retained article/request content is available after restart. |
 
 ## Scope and limitations
 
-S1-S15 complete the 50-case dataset, seal the held-out test split, provide
-deterministic scoring and GEPA feedback, freeze the one-predictor DSPy baseline
-with a strict adapter, add the strict-budget guarded LM/ledger, implement the
-explicitly authorized provider preflight with local records, add safe
-program/run persistence with a read-only Replay reader, implement the
-separately confirmed baseline validation, genuine GEPA compile, and paired
-benchmark paths, and add the Replay-default UI foundation with Overview,
-Baseline, and Prompt Inspector. S13 adds the single confirmed Live optimization
-job with progress polling and cooperative cancellation, and Comparison plus
-the unscored Playground. Replay never starts or resumes GEPA and cannot run
-Playground inference. S15 adds the offline release validator, baseline
-development CLI, acceptance-record schema, and preparation/presentation
-runbook. No live preflight, optimization, benchmark, or released archive
-exists, and no paid API call has been made; the first held-out run remains
-pending explicit human approval and a configured key. The host
-Python 3.15.0 installation is untouched; only this project's isolated
-environment uses 3.14.8.
+This is a local, focused demonstration of prompt optimization, not a production
+publishing gate, general fact-checking service, or investment adviser. Reviews
+cover only the six editorial categories and supplied references. Human review
+remains necessary before publishing, and a clean model response is not proof
+that an article is correct.
+
+The 50-case dataset is small and domain-specific. Automated checks and reviews
+do not replace human approval of reference annotations. A valid outcome can be
+unchanged, worse, mixed, or inconclusive. Preserve the original warnings,
+failed outcomes, and test-reuse history when presenting results.

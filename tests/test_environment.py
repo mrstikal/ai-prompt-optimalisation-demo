@@ -192,26 +192,24 @@ def test_gitignore_protects_secrets_and_local_run_artifacts() -> None:
     assert "/logs/" in lines
 
 
-def test_readme_documents_setup_and_stage_status() -> None:
+def test_readme_documents_setup_and_operational_status() -> None:
     text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Status: S1-S15 tooling implemented" in text
-    assert "deterministic evidence matcher" in text
-    assert "one-predictor" in text
-    assert "budget guard" in text.lower()
-    assert "provider preflight" in text.lower()
-    assert "baseline development and gepa" in text.lower()
-    assert "paired benchmark (s11)" in text.lower()
-    assert "artifacts and replay" in text.lower()
-    assert "release validation and first held-out run" in text.lower()
+    normalized = " ".join(text.split())
+    lowered = normalized.lower()
+    assert "Results are not bundled with the source code." in normalized
+    assert "No recorded experiment available" in normalized
+    assert "Replay Experiment" in normalized
+    assert "Live Experiment" in normalized
+    assert "measured" in lowered
+    assert "budget confirmation" in lowered
+    assert "unscored" in lowered
     assert "dspy_lab.release validate" in text
-    assert "present repeatedly with replay" in text.lower()
     assert "uv python install 3.14.8" in text
     assert "uv sync --frozen" in text
+    assert "uv run --frozen --offline pytest -q" in text
     assert "3.14.8" in text
+    assert "30 for training, 10 for validation, and 10 for the held-out benchmark" in (
+        normalized
+    )
     assert "data/editorial_rules_v1.md" in text
-    assert "data/v1/train.jsonl" in text
-    assert "data/v1/validation.jsonl" in text
-    assert "data/v1/test.jsonl" in text
-    assert "data/v1/split_manifest.json" in text
     assert "data/v1/reviews.jsonl" in text
-    assert "data/v1/coverage_report.json" in text
