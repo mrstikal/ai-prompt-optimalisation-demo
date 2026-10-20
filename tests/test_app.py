@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,6 +48,7 @@ def _wrapper(
     fixture: Path | None,
     *,
     real_worker: bool = False,
+    runner_expr: str = "ui_jobs.make_runner()",
 ) -> Path:
     runs = fixture / "runs" if fixture is not None else tmp_path / "empty-runs"
     programs = (
@@ -58,7 +61,7 @@ def _wrapper(
         f"        Path({str(programs)!r}),",
     ]
     if not real_worker:
-        manager_lines.append("        runner=ui_jobs.make_runner(),")
+        manager_lines.append(f"        runner={runner_expr},")
     manager_lines.append("    )")
     wrapper = tmp_path / "ui_wrapper.py"
     wrapper.write_text(
@@ -90,6 +93,7 @@ def _run_app(
     with_stats: bool = True,
     measured: bool = False,
     real_worker: bool = False,
+    runner_expr: str = "ui_jobs.make_runner()",
 ) -> AppTest:
     fixture = None
     if build:
@@ -103,7 +107,14 @@ def _run_app(
         )
     app_module._JOB_MANAGER_OVERRIDE = None
     app = AppTest.from_file(
-        str(_wrapper(tmp_path, fixture, real_worker=real_worker)),
+        str(
+            _wrapper(
+                tmp_path,
+                fixture,
+                real_worker=real_worker,
+                runner_expr=runner_expr,
+            )
+        ),
         default_timeout=60,
     )
     app.run()
@@ -190,6 +201,7 @@ def _all_text(app: AppTest) -> str:
     parts.extend(str(item.label) for item in app.button)
     parts.extend(str(item.label) for item in app.checkbox)
     for box in app.selectbox:
+        parts.append(str(box.label))
         parts.append(str(box.value))
         parts.extend(str(option) for option in box.options)
     return "\n".join(parts)
@@ -423,7 +435,7 @@ def test_live_reads_recorded_development_run_without_paid_actions(
     app = _run_app(tmp_path)
     app = _set_mode(app, MODE_LIVE)
     assert app.radio[0].value == MODE_LIVE
-    assert "Live Experiment — one confirmation-gated optimization job" in _all_text(app)
+    assert "Live Experiment — optimization, paired benchmark, and unscored" in _all_text(app)
     assert "mock/test record" in _all_text(app)
     assert "completed (mock_test)" in _all_text(app)
     assert "Recorded baseline development run" in [
@@ -1455,3 +1467,462 @@ def test_job_manager_cancel_before_dispatch_is_stopped(
     handle._thread.join(timeout=3)
     assert handle.status == app_module.JOB_STATUS_STOPPED
     assert handle.ledger.snapshot().stop_reason == "cancelled"
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            hashes[str(path.relative_to(root))] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+    return hashes
+
+
+def _set_text_input(app: AppTest, label: str, value: str, *, run: bool = True) -> AppTest:
+    for item in app.text_input:
+        if item.label == label:
+            item.set_value(value)
+            if run:
+                app.run()
+                assert not app.exception, [
+                    str(error.value) for error in app.exception
+                ]
+            return app
+    raise AssertionError(f"text input {label!r} not found")
+
+
+def _set_text_area(app: AppTest, label: str, value: str, *, run: bool = True) -> AppTest:
+    for item in app.text_area:
+        if item.label == label:
+            item.set_value(value)
+            if run:
+                app.run()
+                assert not app.exception, [
+                    str(error.value) for error in app.exception
+                ]
+            return app
+    raise AssertionError(f"text area {label!r} not found")
+
+
+def _check_checkbox(
+    app: AppTest, label: str, *, run: bool = True
+) -> AppTest:
+    for item in app.checkbox:
+        if item.label == label:
+            item.check()
+            if run:
+                app.run()
+                assert not app.exception, [
+                    str(error.value) for error in app.exception
+                ]
+            return app
+    raise AssertionError(f"checkbox {label!r} not found")
+
+
+def test_replay_comparison_displays_stored_metrics_and_case_changes(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _forbidden_calls(monkeypatch)
+    app = _run_app(tmp_path, measured=True, changed=True)
+    before = _tree_hashes(tmp_path / "fixture")
+    app = _select_screen(app, "Comparison")
+    text = _all_text(app)
+    assert "Paired quality metrics" in text
+    assert "Micro-F1" in text
+    assert "Macro-F1" in text
+    assert "Exposure index" in text
+    assert "Corrected gold issues" in text
+    assert "Optimization candidate history" in text
+    assert "Historical costs and conditional break-even" in text
+    assert (
+        "Stored aggregate metrics were recomputed from the archived raw "
+        "findings and gold and matched." in text
+    )
+    assert "Stored aggregate metrics disagree" not in text
+    assert "Additional API calls: 0" in text
+    summary = json.loads(
+        (
+            tmp_path
+            / "fixture"
+            / "runs"
+            / "benchmarks"
+            / "bench-ui"
+            / "summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    for arm in ("baseline", "optimized"):
+        micro = summary["metrics"][arm]["micro_f1"]
+        if micro is not None:
+            assert f"{micro * 100:.1f}%" in text
+    candidate_box = next(
+        box
+        for box in app.selectbox
+        if box.label == "Recorded candidate instructions"
+    )
+    candidate_box.set_value(candidate_box.options[0]).run()
+    candidate_text = _all_text(app)
+    assert "Candidate index:** 0" in candidate_text
+    assert "This candidate is the unchanged baseline instructions" in candidate_text
+    assert _tree_hashes(tmp_path / "fixture") == before
+
+
+def test_repeated_replay_reads_do_not_modify_archive_or_call_provider(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _forbidden_calls(monkeypatch)
+    app = _run_app(tmp_path, measured=True)
+    fixture = tmp_path / "fixture"
+    before = _tree_hashes(fixture)
+    manifest_before = (
+        fixture / "runs" / "benchmarks" / "bench-ui" / "manifest.json"
+    ).read_text(encoding="utf-8")
+    for screen in (
+        "Overview",
+        "Baseline",
+        "Optimization",
+        "Prompt Inspector",
+        "Comparison",
+        "Playground",
+    ):
+        app = _select_screen(app, screen)
+    for _ in range(2):
+        app = _select_screen(app, "Comparison")
+        app = _select_screen(app, "Playground")
+    assert _tree_hashes(fixture) == before
+    assert (
+        fixture / "runs" / "benchmarks" / "bench-ui" / "manifest.json"
+    ).read_text(encoding="utf-8") == manifest_before
+
+
+def test_replay_playground_has_no_inference_form(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _forbidden_calls(monkeypatch)
+    app = _run_app(tmp_path, measured=True)
+    app = _select_screen(app, "Playground")
+    text = _all_text(app)
+    assert "new Playground inference is disabled" in text
+    assert "Run unscored playground" not in text
+    assert all(item.label != "Article title" for item in app.text_input)
+    assert all(item.label != "Article body" for item in app.text_area)
+    assert not app.button
+
+
+def test_live_playground_requires_separate_confirmation_and_budget(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-s14-fixture")
+    _forbidden_calls(monkeypatch)
+    ui_jobs.reset()
+    ui_jobs.MODE = "complete"
+    app = _run_app(
+        tmp_path,
+        measured=True,
+        runner_expr="ui_jobs.make_playground_runner()",
+    )
+    app = _set_mode(app, MODE_LIVE)
+    app = _select_screen(app, "Playground")
+    text = _all_text(app)
+    assert "Playground budget:** 2 calls / 0.15 USD" in text
+    assert "UNSCORED" not in text
+    app = _set_text_input(
+        app, "Article title", "Nová zlatá mince", run=False
+    )
+    app = _set_text_area(
+        app,
+        "Article body",
+        "Mince má zaručený výnos. Podle prodejce je investice jistá.",
+        run=False,
+    )
+    app = _click_button(app, "Run unscored playground")
+    assert "Explicit playground budget confirmation is required" in _all_text(app)
+    assert ui_jobs.PLAYGROUND_CALLS == 0
+    app = _check_checkbox(
+        app,
+        "I confirm the separate playground budget and that article content "
+        "will be sent to the configured provider.",
+        run=False,
+    )
+    app = _click_button(app, "Run unscored playground")
+    assert ui_jobs.PLAYGROUND_CALLS == 1
+    assert ui_jobs.CALLS == 0
+    spec = ui_jobs.LAST_PLAYGROUND_SPEC
+    assert spec is not None
+    assert spec.title == "Nová zlatá mince"
+    assert spec.retain_content is False
+    manager = app_module._JOB_MANAGER_OVERRIDE
+    assert manager is not None
+    handle = manager.latest_handle_for("playground")
+    assert handle is not None
+    assert handle.ledger.max_calls == 2
+    assert str(handle.ledger.max_cost_usd) == "0.15"
+    for _ in range(50):
+        app.run()
+        if "UNSCORED PLAYGROUND" in _all_text(app):
+            break
+        time.sleep(0.01)
+    text = _all_text(app)
+    assert "UNSCORED PLAYGROUND" in text
+    assert "gold labels or benchmark metric" in text
+    assert "Program ID:** `program-fixture-baseline`" in text
+
+
+def test_live_comparison_benchmark_requires_own_confirmation(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-s14-benchmark")
+    _forbidden_calls(monkeypatch)
+    ui_jobs.reset()
+    ui_jobs.MODE = "complete"
+    app = _run_app(
+        tmp_path,
+        measured=True,
+        runner_expr="ui_jobs.make_benchmark_runner()",
+    )
+    app = _set_mode(app, MODE_LIVE)
+    app = _select_screen(app, "Comparison")
+    text = _all_text(app)
+    assert "Start confirmed benchmark" in text
+    assert "opens the sealed held-out split" in text
+    assert "Recorded benchmark archive" in text
+    app = _click_button(app, "Start confirmed benchmark")
+    assert "Explicit benchmark budget confirmation is required" in _all_text(app)
+    assert ui_jobs.BENCHMARK_CALLS == 0
+    app = _check_checkbox(
+        app,
+        "I confirm this benchmark budget and that this action opens the "
+        "sealed held-out split.",
+    )
+    app = _click_button(app, "Start confirmed benchmark")
+    assert ui_jobs.BENCHMARK_CALLS == 1
+    spec = ui_jobs.LAST_BENCHMARK_SPEC
+    assert spec is not None
+    assert spec.baseline_development_run_id == "dev-ui"
+    assert spec.optimization_run_id == "opt-ui"
+    assert spec.release_results is False
+    assert spec.test_cases is None
+    manager = app_module._JOB_MANAGER_OVERRIDE
+    assert manager is not None
+    handle = manager.latest_handle_for("benchmark")
+    assert handle is not None
+    assert handle.ledger.max_calls == 20
+    assert str(handle.ledger.max_cost_usd) == "0.50"
+
+
+def test_live_comparison_corrupt_archive_is_explicit(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-s14-corrupt")
+    _forbidden_calls(monkeypatch)
+    app = _run_app(tmp_path, measured=True)
+    outcomes = (
+        tmp_path
+        / "fixture"
+        / "runs"
+        / "benchmarks"
+        / "bench-ui"
+        / "outcomes.jsonl"
+    )
+    outcomes.unlink()
+    app = _set_mode(app, MODE_LIVE)
+    app = _select_screen(app, "Comparison")
+    text = _all_text(app)
+    assert "selected benchmark archive cannot be read" in text
+    assert "Nothing is regenerated" in text
+
+
+def test_playground_job_manager_uses_shared_single_job_gate(
+    tmp_path,
+) -> None:
+    runs = tmp_path / "runs"
+    programs = tmp_path / "programs"
+    settings = app_module.Settings(
+        mode="live", openrouter_api_key="sk-or-v1-s14-gate"
+    )
+    manager = app_module.JobManager(
+        runs,
+        programs,
+        runner=lambda spec, handle: SimpleNamespace(status="completed"),
+    )
+    playground_handle = manager.start_playground(
+        app_module.PlaygroundJobSpec(
+            mode=MODE_LIVE,
+            run_id="play-gate",
+            token="token-play",
+            mode_epoch=manager.mode_epoch,
+            confirmation_generation=manager.confirmation_generation,
+            settings=settings,
+            optimization_run_id="opt-ui",
+            title="Title",
+            article_text="Body",
+            product_facts=app_module.ProductFacts(),
+            sources=(),
+            retain_content=False,
+            runs_root=runs,
+            programs_root=programs,
+        )
+    )
+    with pytest.raises(app_module.JobBusyError):
+        manager.start_benchmark(
+            app_module.BenchmarkJobSpec(
+                mode=MODE_LIVE,
+                run_id="bench-gate",
+                token="token-bench",
+                mode_epoch=manager.mode_epoch,
+                confirmation_generation=manager.confirmation_generation,
+                settings=settings,
+                baseline_development_run_id="dev-ui",
+                optimization_run_id="opt-ui",
+                release_results=False,
+                runs_root=runs,
+                programs_root=programs,
+            )
+        )
+    playground_handle._thread.join(timeout=5)
+    assert playground_handle.status == "completed"
+    assert manager.active_handle is None
+
+
+def test_replay_comparison_flags_tampered_stored_metrics(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _forbidden_calls(monkeypatch)
+    app = _run_app(tmp_path, measured=True)
+    benchmark_dir = (
+        tmp_path / "fixture" / "runs" / "benchmarks" / "bench-ui"
+    )
+    summary_path = benchmark_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["metrics"]["baseline"]["tp"] += 1
+    atomic_write_json(summary_path, summary)
+    manifest_path = benchmark_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["summary.json"] = hashlib.sha256(
+        summary_path.read_bytes()
+    ).hexdigest()
+    atomic_write_json(manifest_path, manifest)
+    app = _select_screen(app, "Comparison")
+    text = _all_text(app)
+    assert "Stored aggregate metrics disagree" in text
+    assert "Stored baseline tp" in text
+    assert "does not match the value recomputed" in text
+
+
+def test_benchmark_worker_passes_the_handle_ledger(
+    monkeypatch, tmp_path
+) -> None:
+    import dspy_lab.experiments as experiments
+
+    settings = app_module.Settings(
+        mode="live", openrouter_api_key="sk-or-v1-s14-worker"
+    )
+    ledger = BudgetLedger.from_limits(settings.benchmark_budget())
+    handle = app_module.JobHandle(
+        run_id="bench-worker",
+        token_sha256="a" * 64,
+        mode_epoch=1,
+        runs_root=tmp_path / "runs",
+        programs_root=tmp_path / "programs",
+        settings=settings,
+        ledger=ledger,
+        events_path=tmp_path / "runs" / "benchmarks" / "bench-worker" / "events.jsonl",
+        started_at="2026-10-19T12:00:00Z",
+        job_kind="benchmark",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_benchmark(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(status="completed")
+
+    monkeypatch.setattr(experiments, "run_benchmark", fake_benchmark)
+    monkeypatch.setattr(
+        experiments, "load_benchmark_cases", lambda _data_dir: ()
+    )
+    spec = app_module.BenchmarkJobSpec(
+        mode=MODE_LIVE,
+        run_id="bench-worker",
+        token="token",
+        mode_epoch=1,
+        confirmation_generation=1,
+        settings=settings,
+        baseline_development_run_id="dev-ui",
+        optimization_run_id="opt-ui",
+        release_results=False,
+        runs_root=tmp_path / "runs",
+        programs_root=tmp_path / "programs",
+        test_cases=(),
+    )
+    app_module._run_benchmark_job(spec, handle)
+    assert captured["ledger"] is ledger
+
+
+def test_comparison_recompute_cost_status_precedence(tmp_path) -> None:
+    build_ui_archive(tmp_path, measured=True)
+    archive = open_replay_archive(
+        tmp_path / "runs" / "benchmarks" / "bench-ui",
+        runs_root=tmp_path / "runs",
+        programs_root=tmp_path / "programs",
+    )
+    mixed = [
+        outcome.model_copy(
+            update={
+                "cost_status": (
+                    "estimated"
+                    if outcome.phase == "baseline" and index == 0
+                    else "actual"
+                ),
+                "cost_usd": Decimal("0.001"),
+            }
+        )
+        for index, outcome in enumerate(archive.outcomes)
+    ]
+    metrics = app_module._comparison_recompute(archive.cases, mixed)
+    assert metrics["baseline"]["cost_status"] == "estimated"
+    assert metrics["optimized"]["cost_status"] == "actual"
+    unavailable = [
+        outcome.model_copy(
+            update={"cost_status": "unavailable", "cost_usd": None}
+        )
+        if outcome.phase == "baseline"
+        else outcome
+        for outcome in archive.outcomes
+    ]
+    metrics = app_module._comparison_recompute(
+        archive.cases, unavailable
+    )
+    assert metrics["baseline"]["cost_status"] == "unavailable"
+    assert metrics["baseline"]["cost_per_article_usd"] is None
+
+
+def test_comparison_rescore_preserves_invalid_outcomes(tmp_path) -> None:
+    build_ui_archive(tmp_path, measured=True)
+    archive = open_replay_archive(
+        tmp_path / "runs" / "benchmarks" / "bench-ui",
+        runs_root=tmp_path / "runs",
+        programs_root=tmp_path / "programs",
+    )
+    case = next(
+        case for case in archive.cases if case.gold_findings
+    )
+    outcome = next(
+        item for item in archive.outcomes if item.case_id == case.case_id
+    ).model_copy(
+        update={
+            "status": "error",
+            "findings": None,
+            "error": "parse_error: fixture invalid output",
+            "metric": {"error_kind": "parse_error"},
+        }
+    )
+    score = app_module._rescore_outcome(case, outcome)
+    assert score.valid is False
+    assert score.error_kind == "parse_error"
+    assert score.tp == 0
+    assert score.fp == 0
+    assert score.fn == len(case.gold_findings)

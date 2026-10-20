@@ -42,6 +42,7 @@ from .artifacts import (
     ProgramManifest,
     ProgramSnapshot,
     RecordedOutcome,
+    RecordedRequest,
     RunLinks,
     RunManifest,
     append_jsonl,
@@ -53,6 +54,7 @@ from .artifacts import (
     cases_snapshot_sha256,
     file_index,
     load_program_artifact,
+    open_optimization_run,
     program_reference,
     read_input_snapshot,
     read_program_snapshot,
@@ -78,6 +80,8 @@ from .data import (
     TEST_ARTICLE_COUNT,
     VALIDATION_ARTICLE_COUNT,
     canonical_document_sha256,
+    canonicalize_document,
+    canonicalize_text,
     load_benchmark_cases,
     load_cases,
     load_optimization_cases,
@@ -109,7 +113,13 @@ from .program import (
     case_inputs,
     load_editorial_rules,
 )
-from .schemas import RULES_VERSION, CaseRecord, Finding
+from .schemas import (
+    RULES_VERSION,
+    CaseRecord,
+    Finding,
+    ProductFacts,
+    SourceRecord,
+)
 
 DATA_DIR = PROJECT_ROOT / "data" / "v1"
 METRIC_VERSION = "deterministic_issue_match_v1"
@@ -121,6 +131,11 @@ TEST_REUSE_SCHEMA_VERSION = "test_reuse_history_v1"
 BENCHMARK_PROTOCOL_FILENAME = "benchmark_protocol.json"
 BENCHMARK_SUMMARY_FILENAME = "summary.json"
 TEST_REUSE_FILENAME = "test_reuse_history.json"
+PLAYGROUND_CONFIG_SCHEMA_VERSION = "playground_config_v1"
+PLAYGROUND_SUMMARY_SCHEMA_VERSION = "playground_summary_v1"
+PLAYGROUND_SUMMARY_FILENAME = "summary.json"
+PLAYGROUND_ARTICLE_MAX_LENGTH = 20_000
+PLAYGROUND_TITLE_MAX_LENGTH = 300
 MIN_OPTIMIZATION_HEADROOM_CALLS = 40
 FORMATTING_OVERHEAD_TOKENS = 4_096
 BASELINE_CANDIDATE_ID = "baseline"
@@ -212,6 +227,43 @@ class BenchmarkResult:
     summary: Mapping[str, object]
     ledger: BudgetSnapshot
     requests: tuple[LedgerRequestRecord, ...]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlaygroundArmResult:
+    """One unscored playground prediction and its recorded economics."""
+
+    arm: str
+    program_id: str
+    status: str
+    findings: tuple[Finding, ...] | None
+    error: str | None
+    error_kind: str | None
+    request_ids: tuple[str, ...]
+    requests: tuple[RecordedRequest, ...]
+    cost_usd: Decimal | None
+    cost_status: str
+    latency_ms: float | None
+    input_tokens: int | None
+    output_tokens: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlaygroundResult:
+    """Unscored output of both saved artifacts on supplied text.
+
+    No gold labels or benchmark metric are read or produced.
+    """
+
+    run_id: str
+    run_dir: Path
+    status: str
+    optimization_run_id: str
+    baseline: PlaygroundArmResult
+    optimized: PlaygroundArmResult
+    ledger: BudgetSnapshot
+    retained_content: bool
     warnings: tuple[str, ...]
 
 
@@ -2802,12 +2854,27 @@ def run_benchmark(
     runs_root: Path = RUNS_ROOT,
     programs_root: Path = PROGRAMS_ROOT,
     rules_text: str | None = None,
+    ledger: BudgetLedger | None = None,
 ) -> BenchmarkResult:
     """Re-evaluate two saved programs on sealed test cases, without compiling."""
     _require_live_settings(settings)
     _require_confirmation(confirm_budget)
     limits = settings.benchmark_budget()
     _validate_budget(limits)
+    if ledger is None:
+        ledger = BudgetLedger.from_limits(limits)
+    elif not isinstance(ledger, BudgetLedger):
+        raise ExperimentConfigurationError(
+            "benchmark ledger must be a BudgetLedger"
+        )
+    elif (
+        ledger.max_calls != limits.max_calls
+        or ledger.max_cost_usd != limits.max_cost_usd
+    ):
+        raise ExperimentConfigurationError(
+            "injected benchmark ledger limits do not match the confirmed "
+            "benchmark budget"
+        )
     test_list = _validate_case_sequence(test_cases, name="sealed test cases")
     rules = _frozen_rules_text(rules_text)
     if origin not in ("live", "mock_test"):
@@ -2964,7 +3031,6 @@ def run_benchmark(
                 ),
             },
         )
-    ledger = BudgetLedger.from_limits(limits)
     write_lock = threading.Lock()
 
     def listener(record: LedgerRequestRecord) -> None:
@@ -3224,6 +3290,447 @@ def run_benchmark(
         ledger=final_budget,
         requests=ledger.records,
         warnings=tuple(manifest_warnings),
+    )
+
+
+def run_playground(
+    settings: Settings,
+    *,
+    optimization_run_id: str,
+    title: str,
+    article_text: str,
+    product_facts: ProductFacts | None = None,
+    sources: Sequence[SourceRecord] = (),
+    retain_content: bool = False,
+    confirm_budget: bool = False,
+    run_id: str | None = None,
+    runs_root: Path = RUNS_ROOT,
+    programs_root: Path = PROGRAMS_ROOT,
+    ledger: BudgetLedger | None = None,
+) -> PlaygroundResult:
+    """Run both frozen artifacts on supplied text without any gold scoring.
+
+    This is a Live-only, separately budgeted phase. It never loads the sealed
+    test split, never invokes GEPA, and never computes a benchmark metric.
+    Article/request content is not retained on disk unless the operator
+    explicitly opts in.
+    """
+    _require_live_settings(settings)
+    _require_confirmation(confirm_budget)
+    limits = settings.playground_budget()
+    _validate_budget(limits)
+    if ledger is None:
+        ledger = BudgetLedger.from_limits(limits)
+    elif not isinstance(ledger, BudgetLedger):
+        raise ExperimentConfigurationError(
+            "playground ledger must be a BudgetLedger"
+        )
+    elif (
+        ledger.max_calls != limits.max_calls
+        or ledger.max_cost_usd != limits.max_cost_usd
+    ):
+        raise ExperimentConfigurationError(
+            "injected playground ledger limits do not match the confirmed "
+            "playground budget"
+        )
+    if not isinstance(retain_content, bool):
+        raise ExperimentConfigurationError(
+            "retain_content must be a boolean"
+        )
+    if isinstance(product_facts, ProductFacts):
+        facts = product_facts
+    elif product_facts is None:
+        facts = ProductFacts()
+    else:
+        raise ExperimentConfigurationError(
+            "product_facts must be a ProductFacts instance"
+        )
+    source_records = tuple(sources)
+    for source in source_records:
+        if not isinstance(source, SourceRecord):
+            raise ExperimentConfigurationError(
+                "playground sources must be SourceRecord instances"
+            )
+    source_ids = [source.source_id for source in source_records]
+    if len(source_ids) != len(set(source_ids)):
+        raise ExperimentConfigurationError(
+            "playground source_id values must be unique"
+        )
+    if not isinstance(title, str) or not title.strip():
+        raise ExperimentConfigurationError(
+            "playground article title must be non-empty text"
+        )
+    if "\n" in title or "\r" in title:
+        raise ExperimentConfigurationError(
+            "playground article title must be a single line"
+        )
+    canonical_title = canonicalize_text(title)
+    canonical_body = canonicalize_text(article_text)
+    if not canonical_body.strip():
+        raise ExperimentConfigurationError(
+            "playground article text must be non-empty"
+        )
+    if len(canonical_title) > PLAYGROUND_TITLE_MAX_LENGTH:
+        raise ExperimentConfigurationError(
+            "playground article title exceeds the length limit"
+        )
+    if len(canonical_body) > PLAYGROUND_ARTICLE_MAX_LENGTH:
+        raise ExperimentConfigurationError(
+            "playground article text exceeds the length limit"
+        )
+    document_text = canonicalize_document(canonical_title, canonical_body)
+    optimization_run_id = _validate_run_id(optimization_run_id)
+    run_id = _validate_run_id(run_id or _new_run_id("play"))
+    secret = settings.openrouter_api_key
+    optimization = open_optimization_run(
+        Path(runs_root) / "optimization" / optimization_run_id,
+        runs_root=Path(runs_root),
+        programs_root=Path(programs_root),
+    )
+    if optimization.manifest.status != "completed":
+        raise ExperimentIncompleteError(
+            f"optimization run is {optimization.manifest.status!r}, "
+            "not completed"
+        )
+    if optimization.manifest.origin != "live":
+        raise ExperimentIncompleteError(
+            "playground requires completed Live program artifacts"
+        )
+    links = optimization.manifest.links
+    baseline_id = links.baseline_program_id
+    optimized_id = links.optimized_program_id
+    if baseline_id is None or optimized_id is None:
+        raise ExperimentIncompleteError(
+            "optimization run does not link both program artifacts"
+        )
+    development_id = links.baseline_development_run_id
+    if development_id is None:
+        raise ExperimentIncompleteError(
+            "optimization run has no linked baseline development run"
+        )
+    development_dir = Path(runs_root) / "development" / development_id
+    if not development_dir.is_dir():
+        raise ExperimentIncompleteError(
+            "linked baseline development run is missing"
+        )
+    development_manifest = read_run_manifest(development_dir)
+    if (
+        development_manifest.kind != "development"
+        or development_manifest.status != "completed"
+        or development_manifest.origin != "live"
+    ):
+        raise ExperimentIncompleteError(
+            "playground requires a completed Live baseline development run"
+        )
+    rules = _frozen_rules_text(optimization.rules_text)
+    baseline_loaded = load_program_artifact(
+        Path(programs_root) / baseline_id
+    )
+    if optimized_id == baseline_id:
+        optimized_loaded = baseline_loaded
+    else:
+        optimized_loaded = load_program_artifact(
+            Path(programs_root) / optimized_id
+        )
+    for label, loaded in (
+        ("baseline", baseline_loaded),
+        ("optimized", optimized_loaded),
+    ):
+        _assert_program_contract(
+            loaded.program, context=f"playground {label} program"
+        )
+        if (
+            loaded.program.predict.signature.instructions
+            != loaded.manifest.instructions
+        ):
+            raise ExperimentIncompleteError(
+                f"{label} program instructions do not match its manifest"
+            )
+    run_dir = _new_run_dir(Path(runs_root), "playground", run_id)
+    created_at = _utc_string()
+    atomic_write_json(
+        run_dir / "config.json",
+        {
+            "schema_version": PLAYGROUND_CONFIG_SCHEMA_VERSION,
+            "run_id": run_id,
+            "origin": "live",
+            "created_at": created_at,
+            "optimization_run_id": optimization_run_id,
+            "baseline_development_run_id": development_id,
+            "baseline_program_id": baseline_id,
+            "optimized_program_id": optimized_id,
+            "task": _task_config_payload(settings),
+            "rules_version": RULES_VERSION,
+            "rules_sha256": sha256_text(rules),
+            "title_sha256": sha256_text(canonical_title),
+            "article_sha256": sha256_text(document_text),
+            "title_length": len(canonical_title),
+            "article_length": len(document_text),
+            "retain_content": retain_content,
+            "budget": {
+                "max_calls": limits.max_calls,
+                "max_cost_usd": str(limits.max_cost_usd),
+            },
+        },
+    )
+    if retain_content:
+        atomic_write_jsonl(run_dir / RUN_REQUESTS_FILENAME, [])
+    _append_event(
+        run_dir,
+        {
+            "event": "playground_started",
+            "run_id": run_id,
+            "optimization_run_id": optimization_run_id,
+            "baseline_program_id": baseline_id,
+            "optimized_program_id": optimized_id,
+        },
+    )
+    write_lock = threading.Lock()
+
+    def listener(record: LedgerRequestRecord) -> None:
+        if not retain_content:
+            return
+        with write_lock:
+            _write_requests(run_dir, ledger, secret)
+
+    task_lm = build_guarded_lm(
+        settings,
+        role="task",
+        ledger=ledger,
+        token_counter=conservative_token_counter,
+        formatting_overhead_tokens=FORMATTING_OVERHEAD_TOKENS,
+        record_listener=listener,
+    )
+    programs = {
+        "baseline": baseline_loaded,
+        "optimized": optimized_loaded,
+    }
+    arm_results: dict[str, PlaygroundArmResult] = {}
+    stop_reason: str | None = None
+    with dspy.context(lm=task_lm, adapter=StrictJSONAdapter()):
+        for arm in ("baseline", "optimized"):
+            loaded = programs[arm]
+            request_count = len(ledger.records)
+            started = time.perf_counter()
+            error: str | None = None
+            error_kind: str | None = None
+            findings: tuple[Finding, ...] | None = None
+            prediction = None
+            try:
+                prediction = loaded.program(
+                    document_text=document_text,
+                    product_facts=facts,
+                    sources=list(source_records),
+                    editorial_rules=rules,
+                )
+            except BudgetStop as exc:
+                error = _sanitize_text(
+                    f"{type(exc).__name__}: {exc}", secret
+                )
+                error_kind = "budget_stop"
+                stop_reason = (
+                    ledger.snapshot().stop_reason or "budget_stop"
+                )
+            except AdapterParseError as exc:
+                error = _sanitize_text(
+                    f"{type(exc).__name__}: {exc}", secret
+                )
+                error_kind = "parse_error"
+            except Exception as exc:  # noqa: BLE001 - one arm's failure
+                error = _sanitize_text(
+                    f"{type(exc).__name__}: {exc}", secret
+                )
+                error_kind = "request_error"
+            if prediction is not None:
+                raw_findings = getattr(prediction, "findings", None)
+                if isinstance(raw_findings, list):
+                    try:
+                        findings = tuple(
+                            item
+                            if isinstance(item, Finding)
+                            else Finding.model_validate(item)
+                            for item in raw_findings
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        error = _sanitize_text(
+                            f"invalid findings: {exc}", secret
+                        )
+                        error_kind = "parse_error"
+                        findings = None
+                else:
+                    error = "prediction did not expose a findings list"
+                    error_kind = "missing_output"
+            records = ledger.records[request_count:]
+            cost_usd, cost_status = _case_cost(records)
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            request_ids = tuple(record.call_id for record in records)
+            arm_results[arm] = PlaygroundArmResult(
+                arm=arm,
+                program_id=loaded.manifest.program_id,
+                status="ok" if findings is not None else "error",
+                findings=findings,
+                error=error,
+                error_kind=error_kind,
+                request_ids=request_ids,
+                requests=tuple(
+                    RecordedRequest.model_validate(
+                        _request_payload(record, secret)
+                    )
+                    for record in records
+                ),
+                cost_usd=cost_usd,
+                cost_status=cost_status,
+                latency_ms=latency_ms,
+                input_tokens=sum(
+                    record.input_tokens or 0
+                    for record in records
+                    if record.input_tokens is not None
+                )
+                if records and all(
+                    record.input_tokens is not None for record in records
+                )
+                else None,
+                output_tokens=sum(
+                    record.output_tokens or 0
+                    for record in records
+                    if record.output_tokens is not None
+                )
+                if records and all(
+                    record.output_tokens is not None for record in records
+                )
+                else None,
+            )
+            _append_event(
+                run_dir,
+                {
+                    "event": "playground_arm_finished",
+                    "arm": arm,
+                    "status": arm_results[arm].status,
+                    "error_kind": error_kind,
+                    "request_count": len(records),
+                    "cost_status": cost_status,
+                },
+            )
+            if stop_reason in _TERMINAL_BUDGET_STOPS:
+                break
+    final_budget = ledger.snapshot()
+    if final_budget.stop_reason in _TERMINAL_BUDGET_STOPS:
+        status = "stopped"
+        stop_reason = final_budget.stop_reason
+    else:
+        status = "completed"
+    for arm in ("baseline", "optimized"):
+        if arm not in arm_results:
+            arm_results[arm] = PlaygroundArmResult(
+                arm=arm,
+                program_id=programs[arm].manifest.program_id,
+                status="error",
+                findings=None,
+                error="budget stopped before this arm was dispatched",
+                error_kind="budget_stop",
+                request_ids=(),
+                requests=(),
+                cost_usd=None,
+                cost_status="none",
+                latency_ms=None,
+                input_tokens=None,
+                output_tokens=None,
+            )
+    warnings: list[str] = []
+    if baseline_id == optimized_id:
+        warnings.append(
+            "The selected program is the unchanged baseline; both arms "
+            "used the same frozen artifact."
+        )
+    if any(arm_results[arm].status != "ok" for arm in arm_results):
+        warnings.append(
+            "At least one playground arm returned an error; failed outputs "
+            "remain visible and are not scored."
+        )
+    if status == "stopped":
+        warnings.append(
+            "Playground stopped at its confirmed budget before both arms "
+            "completed. Charges already incurred are not reversed."
+        )
+    if not retain_content:
+        warnings.append(
+            "Article, findings, and request text were not persisted. "
+            "Results exist only in this local app session."
+        )
+    if retain_content:
+        _write_requests(run_dir, ledger, secret)
+    finished_at = _utc_string()
+    arm_payloads: dict[str, object] = {}
+    for arm, result in arm_results.items():
+        payload: dict[str, object] = {
+            "arm": result.arm,
+            "program_id": result.program_id,
+            "status": result.status,
+            "request_ids": list(result.request_ids),
+            "cost_usd": (
+                None if result.cost_usd is None else str(result.cost_usd)
+            ),
+            "cost_status": result.cost_status,
+            "latency_ms": result.latency_ms,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+        }
+        if retain_content:
+            payload["error"] = result.error
+            payload["error_kind"] = result.error_kind
+            payload["findings"] = (
+                None
+                if result.findings is None
+                else [
+                    finding.model_dump(mode="json")
+                    for finding in result.findings
+                ]
+            )
+        else:
+            payload["error_kind"] = result.error_kind
+        arm_payloads[arm] = payload
+    summary = {
+        "schema_version": PLAYGROUND_SUMMARY_SCHEMA_VERSION,
+        "run_id": run_id,
+        "status": status,
+        "optimization_run_id": optimization_run_id,
+        "baseline_development_run_id": development_id,
+        "created_at": created_at,
+        "finished_at": finished_at,
+        "unscored": True,
+        "gold_used": False,
+        "retain_content": retain_content,
+        "title_sha256": sha256_text(canonical_title),
+        "article_sha256": sha256_text(document_text),
+        "rules_sha256": sha256_text(rules),
+        "arms": arm_payloads,
+        "budget": _budget_payload(final_budget),
+        "stop_reason": stop_reason,
+        "warnings": warnings,
+        "note": (
+            "Unscored playground output; no gold labels, benchmark metric, "
+            "candidate selection, or held-out test data were used."
+        ),
+    }
+    atomic_write_json(run_dir / PLAYGROUND_SUMMARY_FILENAME, summary)
+    _append_event(
+        run_dir,
+        {
+            "event": "playground_finished",
+            "status": status,
+            "stop_reason": stop_reason,
+        },
+    )
+    return PlaygroundResult(
+        run_id=run_id,
+        run_dir=run_dir,
+        status=status,
+        optimization_run_id=optimization_run_id,
+        baseline=arm_results["baseline"],
+        optimized=arm_results["optimized"],
+        ledger=final_budget,
+        retained_content=retain_content,
+        warnings=tuple(warnings),
     )
 
 
@@ -3889,6 +4396,8 @@ __all__ = [
     "BenchmarkResult",
     "OptimizationResult",
     "PairedMeasurement",
+    "PlaygroundArmResult",
+    "PlaygroundResult",
     "compute_break_even",
     "derive_paired_orders",
     "latency_summary",
@@ -3898,5 +4407,6 @@ __all__ = [
     "run_baseline_development",
     "run_benchmark",
     "run_optimization",
+    "run_playground",
     "summarize_benchmark",
 ]

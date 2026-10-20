@@ -19,6 +19,7 @@ from dspy_lab.artifacts import (
 )
 from dspy_lab.config import Settings
 from dspy_lab.data import file_sha256, load_cases
+from dspy_lab.llm import BudgetLedger
 from dspy_lab.experiments import (
     BENCHMARK_PROTOCOL_FILENAME,
     BENCHMARK_SUMMARY_FILENAME,
@@ -944,3 +945,58 @@ def test_benchmark_budget_stop_is_incomplete(monkeypatch, tmp_path) -> None:
             runs_root=tmp_path / "runs",
             programs_root=tmp_path / "programs",
         )
+
+
+def test_benchmark_rejects_mismatched_injected_ledger(
+    monkeypatch, tmp_path
+) -> None:
+    _train, _development, test = fixture_cases()
+    development_run, optimization_run, settings = make_saved_pair(
+        monkeypatch, tmp_path, test
+    )
+    calls = install_transport(monkeypatch, benchmark_handler(test))
+    mismatched = BudgetLedger(max_calls=19, max_cost_usd="0.50")
+    with pytest.raises(
+        experiments.ExperimentConfigurationError, match="ledger limits"
+    ):
+        run_benchmark(
+            settings,
+            test,
+            baseline_development_run_id=development_run.run_id,
+            optimization_run_id=optimization_run.run_id,
+            confirm_budget=True,
+            origin="mock_test",
+            run_id="bench-ledger-mismatch",
+            runs_root=tmp_path / "runs",
+            programs_root=tmp_path / "programs",
+            ledger=mismatched,
+        )
+    assert calls == []
+
+
+def test_benchmark_cancelled_injected_ledger_dispatches_nothing(
+    monkeypatch, tmp_path
+) -> None:
+    _train, _development, test = fixture_cases()
+    development_run, optimization_run, settings = make_saved_pair(
+        monkeypatch, tmp_path, test
+    )
+    calls = install_transport(monkeypatch, benchmark_handler(test))
+    ledger = BudgetLedger.from_limits(settings.benchmark_budget())
+    ledger.cancel("cancelled")
+    result = run_benchmark(
+        settings,
+        test,
+        baseline_development_run_id=development_run.run_id,
+        optimization_run_id=optimization_run.run_id,
+        confirm_budget=True,
+        origin="mock_test",
+        run_id="bench-ledger-cancelled",
+        runs_root=tmp_path / "runs",
+        programs_root=tmp_path / "programs",
+        ledger=ledger,
+    )
+    assert calls == []
+    assert result.ledger.admitted_calls == 0
+    assert result.manifest.status == "stopped"
+    assert result.summary["complete"] is False
